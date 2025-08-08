@@ -317,7 +317,7 @@ func (r *repo) createExpenseTx(ctx context.Context, st *addExpenseState) (int64,
 	if st.SplitMode == "equal" {
 		shares = map[int64]int64{}
 		var count int64 = 0
-		for pid, on := range st.Participants {
+		for _, on := range st.Participants {
 			if on {
 				count++
 			}
