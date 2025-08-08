@@ -1,0 +1,1 @@
+-- This file is informational; the app auto-creates the schema.
