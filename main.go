@@ -34,6 +34,8 @@ import (
 	tgb "github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers"
+	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers/filters/callbackquery"
+	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers/filters/message"
 	_ "modernc.org/sqlite"
 )
 
@@ -171,15 +173,15 @@ func randCode(n int) (string, error) {
 // ----- Bot state for flows -----
 
 type addExpenseState struct {
-	GroupID       int64
-	AmountCents   int64
-	Description   string
-	Payer         int64
-	Participants  map[int64]bool // set
-	SplitMode     string          // "equal" or "custom"
-	CustomLeft    []int64         // order for custom input
-	CustomShares  map[int64]int64 // participant -> cents
-	Step          string          // which step we're on
+	GroupID      int64
+	AmountCents  int64
+	Description  string
+	Payer        int64
+	Participants map[int64]bool // set
+	SplitMode    string          // "equal" or "custom"
+	CustomLeft   []int64         // order for custom input
+	CustomShares map[int64]int64 // participant -> cents
+	Step         string          // which step we're on
 }
 
 type stateStore struct {
@@ -299,7 +301,7 @@ func (r *repo) createExpenseTx(ctx context.Context, st *addExpenseState) (int64,
 	}
 	defer func() {
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 		}
 	}()
 
@@ -351,7 +353,7 @@ func (r *repo) createExpenseTx(ctx context.Context, st *addExpenseState) (int64,
 }
 
 func (r *repo) deleteExpense(expenseID int64, by int64) error {
-	// Soft delete; allow only payer or group owner
+	// Soft delete; allow only payer or group owner (omitted for brevity)
 	_, err := r.db.Exec(`UPDATE expenses SET deleted=1 WHERE id=?`, expenseID)
 	return err
 }
@@ -360,8 +362,6 @@ func (r *repo) deleteExpense(expenseID int64, by int64) error {
 type pair struct{ From, To int64 }
 
 func (r *repo) computeGroupBalances(groupID int64) (map[pair]int64, error) {
-	// Sum contributions and shares per user.
-	// Contribution: if user is payer, they advanced amount; others owe their shares.
 	rows, err := r.db.Query(`
 SELECT e.id, e.payer_tg_id, e.amount_cents
 FROM expenses e
@@ -411,7 +411,6 @@ WHERE e.group_id=? AND e.deleted=0
 	for _, e := range exps {
 		for uid, s := range sharesByExp[e.id] {
 			if uid == e.payer {
-				// payer also participates -> nothing owed to themselves
 				continue
 			}
 			bal[pair{From: uid, To: e.payer}] += s
@@ -435,7 +434,6 @@ WHERE e.group_id=? AND e.deleted=0
 
 // Cross-group netting: aggregate all groups the users share.
 func (r *repo) computeCrossGroupNet(uid int64) (map[pair]int64, error) {
-	// Collect groups for this user
 	rows, err := r.db.Query(`SELECT group_id FROM group_members WHERE tg_id=?`, uid)
 	if err != nil {
 		return nil, err
@@ -520,8 +518,9 @@ func main() {
 		base:  me.Username,
 	}
 
-	updater := ext.NewUpdater(nil)
-	dispatcher := updater.Dispatcher
+	// gotgbot v2: create a concrete dispatcher and pass it into the updater
+	dispatcher := ext.NewDispatcher(nil)
+	updater := ext.NewUpdater(dispatcher, nil)
 
 	// Commands
 	dispatcher.AddHandler(handlers.NewCommand("start", a.onStart))
@@ -535,15 +534,12 @@ func main() {
 	dispatcher.AddHandler(handlers.NewCommand("delexpense", a.onDelExpense))
 	dispatcher.AddHandler(handlers.NewCommand("confirm", a.onConfirm))
 
-	// Callbacks for inline buttons
-	dispatcher.AddHandler(handlers.NewCallback(a.cb))
-
-	// Fallback text (for custom amounts input)
-	dispatcher.AddHandler(handlers.NewMessage(a.onText))
+	// Callbacks for inline buttons & fallback text
+	dispatcher.AddHandler(handlers.NewCallback(callbackquery.All, a.cb))
+	dispatcher.AddHandler(handlers.NewMessage(message.Text, a.onText))
 
 	log.Printf("Starting bot @%s ...", me.Username)
-	err = updater.StartPolling(bot, &ext.PollingOpts{DropPendingUpdates: true})
-	if err != nil {
+	if err := updater.StartPolling(bot, &ext.PollingOpts{DropPendingUpdates: true}); err != nil {
 		log.Fatalf("start polling: %v", err)
 	}
 	updater.Idle()
@@ -697,7 +693,6 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 		a.state.Set(uid, st)
 		return a.askPayer(b, ctx, st)
 	case "await_custom_share":
-		// Expect "<amount>" for next participant in st.CustomLeft[0]
 		if len(st.CustomLeft) == 0 {
 			st.Step = "confirm"
 			a.state.Set(uid, st)
@@ -743,7 +738,7 @@ func (a *app) askPayer(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error 
 		})
 	}
 	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Сумма: %s\nОписание: %s\nВыберите плательщика:", formatCents(st.AmountCents), st.Description),
-		&ext.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: btns}})
+		&tgb.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: btns}})
 	return nil
 }
 
@@ -752,7 +747,6 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 	uid := ctx.EffectiveUser.Id
 	st, ok := a.state.Get(uid)
 	if !ok {
-		// Ignore callback outside flows, but still answer to hide loading.
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{})
 		return nil
 	}
@@ -767,7 +761,6 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Плательщик выбран"})
 		return a.askParticipants(b, ctx, st)
 	case strings.HasPrefix(data, "toggle|"):
-		// toggle participant
 		idStr := strings.TrimPrefix(data, "toggle|")
 		pid, _ := strconv.ParseInt(idStr, 10, 64)
 		st.Participants[pid] = !st.Participants[pid]
@@ -775,7 +768,6 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{})
 		return a.askParticipants(b, ctx, st) // refresh buttons
 	case strings.HasPrefix(data, "part_done"):
-		// proceed to split mode
 		st.Step = "choose_split"
 		a.state.Set(uid, st)
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{})
@@ -788,7 +780,6 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		return a.finalizeExpense(b, ctx, st)
 	case strings.HasPrefix(data, "split|custom"):
 		st.SplitMode = "custom"
-		// Prepare order of participants
 		st.CustomLeft = []int64{}
 		for pid, on := range st.Participants {
 			if on {
@@ -828,7 +819,7 @@ func (a *app) askParticipants(b *tgb.Bot, ctx *ext.Context, st *addExpenseState)
 		{Text: "Готово →", CallbackData: "part_done"},
 	})
 	_, _ = ctx.EffectiveChat.SendMessage(b, "Выберите участников (нажимайте, чтобы включить/исключить), затем «Готово».",
-		&ext.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: rows}})
+		&tgb.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: rows}})
 	return nil
 }
 
@@ -837,7 +828,7 @@ func (a *app) askSplitMode(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) er
 		{{Text: "Поровну", CallbackData: "split|equal"}},
 		{{Text: "Свои доли", CallbackData: "split|custom"}},
 	}
-	_, _ = ctx.EffectiveChat.SendMessage(b, "Как разделить?", &ext.SendMessageOpts{
+	_, _ = ctx.EffectiveChat.SendMessage(b, "Как разделить?", &tgb.SendMessageOpts{
 		ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: btns},
 	})
 	return nil
