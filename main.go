@@ -14,6 +14,7 @@ package main
 // - Кнопка «Поделиться /join…» через tg://msg?text= (без @username), с заменой '+' -> '%20'.
 // - РЕЗЕРВ: парсинг ссылок с ?start=... и «голого» кода в обычных сообщениях.
 // - В тексте про создание группы — кликабельный линк на /join <code> для пересылки.
+// - Новое: экран «Участники» из «Мои группы» с пагинацией.
 //
 // ENV:
 //   BOT_TOKEN=<telegram bot token>
@@ -313,6 +314,30 @@ func (r *repo) listMembers(groupID int64) ([]struct{ ID int64; Name string }, er
 	for rows.Next() {
 		var x struct{ ID int64; Name string }
 		if err := rows.Scan(&x.ID, &x.Name); err != nil {
+			return nil, err
+		}
+		res = append(res, x)
+	}
+	return res, nil
+}
+
+// Новое: участники с ролями (для экрана «Участники»)
+func (r *repo) listMembersDetailed(groupID int64) ([]struct{ ID int64; Name, Role string }, error) {
+	rows, err := r.db.Query(`
+SELECT u.tg_id, u.name, m.role
+FROM group_members m
+JOIN users u ON u.tg_id = m.tg_id
+WHERE m.group_id = ?
+ORDER BY (m.role <> 'owner'), u.name
+`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var res []struct{ ID int64; Name, Role string }
+	for rows.Next() {
+		var x struct{ ID int64; Name, Role string }
+		if err := rows.Scan(&x.ID, &x.Name, &x.Role); err != nil {
 			return nil, err
 		}
 		res = append(res, x)
@@ -791,6 +816,7 @@ func getBestName(ctx *ext.Context) string {
 
 const groupsPerPage = 5
 const expensesPerPage = 10
+const membersPerPage = 15 // новое
 
 func (a *app) buildGroupsPageKeyboard(uid int64, page int, mode string) (*tgb.InlineKeyboardMarkup, int, error) {
 	gs, err := a.repo.listUserGroups(uid)
@@ -1261,6 +1287,18 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		}
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Ошибка удаления группы"})
 		return nil
+
+	// Новое: экран участников
+	case strings.HasPrefix(data, "members|"):
+		// members|<gid>|p:<n>
+		parts := strings.Split(data, "|")
+		if len(parts) >= 3 && strings.HasPrefix(parts[2], "p:") {
+			gid := mustAtoi64(parts[1])
+			page := mustAtoi(strings.TrimPrefix(parts[2], "p:"))
+			_ = a.sendMembersPageEdit(b, ctx, gid, page)
+		}
+		_, _ = ctx.CallbackQuery.Answer(b, nil)
+		return nil
 	}
 
 	// add-expense flow callbacks
@@ -1378,6 +1416,7 @@ func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) erro
     // Кнопки
     rows := [][]tgb.InlineKeyboardButton{
         {{Text: "Поделиться /join…", Url: share}},
+        {{Text: "👥 Участники", CallbackData: fmt.Sprintf("members|%d|p:%d", gid, 0)}}, // новое
         {{Text: "Список трат", CallbackData: fmt.Sprintf("explist|%d|p:%d", gid, 0)}},
     }
     if isOwner, _ := a.repo.isGroupOwner(gid, uid); isOwner {
@@ -1506,6 +1545,49 @@ func (a *app) sendExpensesPageEdit(b *tgb.Bot, ctx *ext.Context, gid int64, page
 		nav = append(nav, tgb.InlineKeyboardButton{Text: "Вперёд »", CallbackData: fmt.Sprintf("explist|%d|p:%d", gid, page+1)})
 	}
 	rows = append(rows, nav)
+
+	editOrSend(b, ctx, sb.String(), &tgb.InlineKeyboardMarkup{InlineKeyboard: rows})
+	return nil
+}
+
+// Новое: экран списка участников с пагинацией
+func (a *app) sendMembersPageEdit(b *tgb.Bot, ctx *ext.Context, gid int64, page int) error {
+	members, err := a.repo.listMembersDetailed(gid)
+	if err != nil {
+		return err
+	}
+	total := len(members)
+	if total == 0 {
+		editOrSend(b, ctx, "В группе пока нет участников.", &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
+			{{Text: "Назад к группе", CallbackData: fmt.Sprintf("mgsel|%d", gid)}},
+		}})
+		return nil
+	}
+	start := page * membersPerPage
+	if start >= total {
+		page = 0
+		start = 0
+	}
+	end := start + membersPerPage
+	if end > total { end = total }
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Участники группы #%d (%d всего), страница %d:\n", gid, total, page+1))
+	for _, m := range members[start:end] {
+		roleMark := ""
+		if m.Role == "owner" { roleMark = " 👑 владелец" }
+		sb.WriteString(fmt.Sprintf("• %s%s\n", m.Name, roleMark))
+	}
+
+	// Навигация
+	nav := []tgb.InlineKeyboardButton{{Text: "Назад к группе", CallbackData: fmt.Sprintf("mgsel|%d", gid)}}
+	if page > 0 {
+		nav = append([]tgb.InlineKeyboardButton{{Text: "« Назад", CallbackData: fmt.Sprintf("members|%d|p:%d", gid, page-1)}}, nav...)
+	}
+	if end < total {
+		nav = append(nav, tgb.InlineKeyboardButton{Text: "Вперёд »", CallbackData: fmt.Sprintf("members|%d|p:%d", gid, page+1)})
+	}
+	rows := [][]tgb.InlineKeyboardButton{nav}
 
 	editOrSend(b, ctx, sb.String(), &tgb.InlineKeyboardMarkup{InlineKeyboard: rows})
 	return nil
