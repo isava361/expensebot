@@ -2,11 +2,13 @@ package main
 
 // Expense-splitting Telegram bot (gotgbot v2 + SQLite, pure Go).
 // Изменения:
-// - Инвайт по ссылке: https://t.me/<bot>?start=join_<GROUP_ID>
-// - Команда /join <group_id>
-// - /mygroups, /invite, /addexpense — с пагинацией по группам
-// - Детали группы: балансы (кому ТЫ должен), инвайт-ссылка, список трат (пагинация), удаление траты, подтверждение оплаты
+// - Инвайт по коду: https://t.me/<bot>?start=<invite_code>
+// - Присоединение: /join_<code> ИЛИ /join <code> ИЛИ deep-link /start <code>
+// - /mygroups, /invite, /addexpense — пагинация по группам
+// - Детали группы: балансы (кому ТЫ должен), инвайт, список трат (пагинация),
+//   удаление траты, подтверждение оплаты, удаление группы (для владельца, с подтверждением)
 // - /balances: сводка "кому ты должен" по всем группам
+// - Валидация названия группы, запрет пустых
 //
 // ENV:
 //   BOT_TOKEN=<telegram bot token>
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,6 +56,7 @@ func mustOpenDB() *sql.DB {
 func initSchema(db *sql.DB) error {
 	schema := `
 PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS users(
     tg_id INTEGER PRIMARY KEY,
@@ -161,7 +165,7 @@ func randCode(n int) (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	return base64.RawURLEncoding.EncodeToString(b), nil // URL-safe (-,_)
 }
 
 // ---------- State ----------
@@ -214,7 +218,7 @@ func (r *repo) upsertUser(tgID int64, name string) error {
 }
 
 func (r *repo) createGroup(title string, owner int64) (int64, string, error) {
-	code, err := randCode(6)
+	code, err := randCode(8)
 	if err != nil {
 		return 0, "", err
 	}
@@ -240,17 +244,6 @@ func (r *repo) joinByCode(code string, uid int64) (int64, string, error) {
 	_, err = r.db.Exec(`INSERT INTO group_members(group_id,tg_id,role) VALUES(?,?,?)
 		ON CONFLICT(group_id,tg_id) DO NOTHING`, gid, uid, "member")
 	return gid, title, err
-}
-
-// Новое: join по group_id
-func (r *repo) joinByGroupID(gid int64, uid int64) (string, error) {
-	var title string
-	if err := r.db.QueryRow(`SELECT title FROM groups WHERE id=?`, gid).Scan(&title); err != nil {
-		return "", err
-	}
-	_, err := r.db.Exec(`INSERT INTO group_members(group_id,tg_id,role) VALUES(?,?,?)
-		ON CONFLICT(group_id,tg_id) DO NOTHING`, gid, uid, "member")
-	return title, err
 }
 
 func (r *repo) listUserGroups(uid int64) ([]struct{ ID int64; Title string }, error) {
@@ -296,6 +289,19 @@ func (r *repo) getInviteCode(groupID int64) (string, error) {
 	return code, err
 }
 
+func (r *repo) isGroupOwner(groupID, uid int64) (bool, error) {
+	var owner int64
+	if err := r.db.QueryRow(`SELECT owner_tg_id FROM groups WHERE id=?`, groupID).Scan(&owner); err != nil {
+		return false, err
+	}
+	return owner == uid, nil
+}
+
+func (r *repo) deleteGroup(groupID int64) error {
+	_, err := r.db.Exec(`DELETE FROM groups WHERE id=?`, groupID)
+	return err
+}
+
 func (r *repo) createExpenseTx(ctx context.Context, st *addExpenseState) (int64, error) {
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
@@ -318,7 +324,7 @@ func (r *repo) createExpenseTx(ctx context.Context, st *addExpenseState) (int64,
 	if st.SplitMode == "equal" {
 		shares = map[int64]int64{}
 		var count int64 = 0
-		for _, on := range st.Participants { // pid не нужен
+		for _, on := range st.Participants {
 			if on {
 				count++
 			}
@@ -568,7 +574,7 @@ func main() {
 	dispatcher.AddHandler(handlers.NewCommand("invite", a.onInvite))
 	dispatcher.AddHandler(handlers.NewCommand("addexpense", a.onAddExpense))
 	dispatcher.AddHandler(handlers.NewCommand("balances", a.onBalances))
-	dispatcher.AddHandler(handlers.NewCommand("join", a.onJoin)) // новое
+	dispatcher.AddHandler(handlers.NewCommand("join", a.onJoin)) // /join <code>
 
 	// Inline callbacks & text
 	dispatcher.AddHandler(handlers.NewCallback(callbackquery.All, a.cb))
@@ -588,23 +594,12 @@ func (a *app) onStart(b *tgb.Bot, ctx *ext.Context) error {
 	name := getBestName(ctx)
 	_ = a.repo.upsertUser(uid, name)
 
-	// Deep-link обработка
-	args := ctx.Args()
-	if len(args) == 1 {
-		p := args[0]
-		switch {
-		case strings.HasPrefix(p, "join_"):
-			gid, _ := strconv.ParseInt(strings.TrimPrefix(p, "join_"), 10, 64)
-			if title, err := a.repo.joinByGroupID(gid, uid); err == nil {
-				_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
-				return nil
-			}
-		default:
-			// совместимость со старыми кодами
-			if gid, title, err := a.repo.joinByCode(p, uid); err == nil {
-				_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
-				return nil
-			}
+	// Deep-link: /start <invite_code>
+	if args := ctx.Args(); len(args) == 1 {
+		code := args[0]
+		if gid, title, err := a.repo.joinByCode(code, uid); err == nil {
+			_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
+			return nil
 		}
 	}
 
@@ -615,7 +610,8 @@ func (a *app) onStart(b *tgb.Bot, ctx *ext.Context) error {
 		"/invite — получить инвайт-ссылку для группы\n" +
 		"/addexpense — добавить трату (сначала выбери группу)\n" +
 		"/balances — кому ты должен по группам\n" +
-		"/join <group_id> — присоединиться к группе"
+		"/join <код> — присоединиться по коду\n" +
+		"Также можно отправить команду вида: /join_<код>"
 	_, _ = ctx.EffectiveChat.SendMessage(b, msg, nil)
 	return nil
 }
@@ -631,22 +627,25 @@ func getBestName(ctx *ext.Context) string {
 	return fmt.Sprintf("%d", u.Id)
 }
 
+// --- Parse title robustly (supports "/newgroup title" or "/newgroup\n title") ---
+var leadingCmd = regexp.MustCompile(`^/\w+(?:@\w+)?\s*`)
+
 func (a *app) onNewGroup(b *tgb.Bot, ctx *ext.Context) error {
-	if len(ctx.Args()) == 0 {
-		_, _ = ctx.EffectiveChat.SendMessage(b, "Использование: /newgroup <название>", nil)
+	raw := strings.TrimSpace(ctx.EffectiveMessage.Text)
+	title := strings.TrimSpace(leadingCmd.ReplaceAllString(raw, ""))
+	if title == "" || strings.HasPrefix(title, "/") {
+		_, _ = ctx.EffectiveChat.SendMessage(b, "Использование: /newgroup <название> (на одной строке). Название не может быть пустым.", nil)
 		return nil
 	}
-	title := strings.Join(ctx.Args(), " ")
+
 	uid := ctx.EffectiveUser.Id
 	_ = a.repo.upsertUser(uid, getBestName(ctx))
 	gid, code, err := a.repo.createGroup(title, uid)
 	if err != nil {
 		return err
 	}
-	// оставляем старую ссылку + показываем новую (join_gid)
-	oldLink := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
-	newLink := fmt.Sprintf("https://t.me/%s?start=join_%d", a.base, gid)
-	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d создана: %s\nСтарая ссылка: %s\nНовая ссылка: %s", gid, title, oldLink, newLink), nil)
+	link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
+	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d создана: %s\nПриглашение: %s\nКоманда: /join_%s", gid, title, link, code), nil)
 	return nil
 }
 
@@ -665,7 +664,6 @@ func (a *app) buildGroupsPageKeyboard(uid int64, page int, mode string) (*tgb.In
 	if total == 0 {
 		return &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{}}, 0, nil
 	}
-	// stable order
 	sort.Slice(gs, func(i, j int) bool { return gs[i].ID > gs[j].ID })
 
 	start := page * groupsPerPage
@@ -690,7 +688,6 @@ func (a *app) buildGroupsPageKeyboard(uid int64, page int, mode string) (*tgb.In
 		}
 		rows = append(rows, []tgb.InlineKeyboardButton{{Text: fmt.Sprintf("#%d: %s", g.ID, g.Title), CallbackData: cb}})
 	}
-	// nav
 	nav := []tgb.InlineKeyboardButton{}
 	if page > 0 {
 		nav = append(nav, tgb.InlineKeyboardButton{Text: "« Назад", CallbackData: fmt.Sprintf("%s|p:%d", mode, page-1)})
@@ -747,9 +744,12 @@ func (a *app) onAddExpense(b *tgb.Bot, ctx *ext.Context) error {
 
 func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 	uid := ctx.EffectiveUser.Id
-
-	// Новая join-ссылка
-	link := fmt.Sprintf("https://t.me/%s?start=join_%d", a.base, gid)
+	// invite link + command
+	code, err := a.repo.getInviteCode(gid)
+	if err != nil {
+		return err
+	}
+	link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
 
 	// balances (только где ТЫ должник)
 	bal, err := a.repo.computeGroupBalances(gid)
@@ -770,7 +770,7 @@ func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 
 	var lines []string
 	lines = append(lines, fmt.Sprintf("Группа #%d", gid))
-	lines = append(lines, fmt.Sprintf("Приглашение: %s", link))
+	lines = append(lines, fmt.Sprintf("Приглашение: %s\nКоманда: /join_%s", link, code))
 	if len(debts) == 0 {
 		lines = append(lines, "Вы никому не должны в этой группе 🎉")
 	} else {
@@ -780,8 +780,17 @@ func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 	// keyboard
 	rows := [][]tgb.InlineKeyboardButton{
 		{{Text: "Список трат", CallbackData: fmt.Sprintf("explist|%d|p:%d", gid, 0)}},
-		{{Text: "Назад к моим группам", CallbackData: "mg|p:0"}},
 	}
+
+	// если владелец — кнопка удаления группы (с подтверждением)
+	if isOwner, _ := a.repo.isGroupOwner(gid, uid); isOwner {
+		rows = append(rows, []tgb.InlineKeyboardButton{
+			{Text: "🗑 Удалить группу", CallbackData: fmt.Sprintf("grpdel|gid:%d", gid)},
+		})
+	}
+
+	// back
+	rows = append(rows, []tgb.InlineKeyboardButton{{Text: "Назад к моим группам", CallbackData: "mg|p:0"}})
 
 	// per-debt confirm
 	for _, d := range debts {
@@ -800,8 +809,12 @@ func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 }
 
 func (a *app) sendInviteForGroup(b *tgb.Bot, ctx *ext.Context, gid int64) error {
-	url := fmt.Sprintf("https://t.me/%s?start=join_%d", a.base, gid)
-	text := fmt.Sprintf("Приглашение в группу #%d:\n%s", gid, url)
+	code, err := a.repo.getInviteCode(gid)
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
+	text := fmt.Sprintf("Приглашение в группу #%d:\n%s\nКоманда: /join_%s", gid, url, code)
 	_, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
 		ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
 			{{Text: "Открыть бота по ссылке", Url: url}},
@@ -866,12 +879,21 @@ func (a *app) sendExpensesPage(b *tgb.Bot, ctx *ext.Context, gid int64, page int
 // ---------- Text flow (add expense) ----------
 
 func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
+	// поддержка команд вида /join_<code>
+	txt := strings.TrimSpace(ctx.EffectiveMessage.Text)
+	if strings.HasPrefix(txt, "/join_") {
+		code := strings.Fields(strings.TrimPrefix(txt, "/join_"))[0]
+		if gid, title, err := a.repo.joinByCode(code, ctx.EffectiveUser.Id); err == nil {
+			_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
+			return nil
+		}
+	}
+
 	uid := ctx.EffectiveUser.Id
 	st, ok := a.state.Get(uid)
 	if !ok {
 		return nil
 	}
-	txt := strings.TrimSpace(ctx.EffectiveMessage.Text)
 	switch st.Step {
 	case "await_amount_desc":
 		parts := strings.Fields(txt)
@@ -982,7 +1004,8 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 
 	// expenses
 	case strings.HasPrefix(data, "explist|"):
-		parts := strings.Split(data, "|") // explist|<gid>|p:<n>
+		// explist|<gid>|p:<n>
+		parts := strings.Split(data, "|")
 		if len(parts) >= 3 && strings.HasPrefix(parts[2], "p:") {
 			gid := mustAtoi64(parts[1])
 			page := mustAtoi(strings.TrimPrefix(parts[2], "p:"))
@@ -1025,6 +1048,36 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		}
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Ошибка подтверждения"})
 		return nil
+
+	// delete group (owner)
+	case strings.HasPrefix(data, "grpdel|"):
+		// grpdel|gid:<gid>
+		gid := mustAtoi64(strings.TrimPrefix(data, "grpdel|gid:"))
+		uid := ctx.EffectiveUser.Id
+		if isOwner, _ := a.repo.isGroupOwner(gid, uid); !isOwner {
+			_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Только владелец может удалить группу"})
+			return nil
+		}
+		// ask confirm
+		_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Точно удалить группу #%d? Это удалит все её данные.", gid),
+			&tgb.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
+				{{Text: "Да, удалить", CallbackData: fmt.Sprintf("grpdelyes|gid:%d", gid)}},
+				{{Text: "Отмена", CallbackData: fmt.Sprintf("mgsel|%d", gid)}},
+			}}})
+		_, _ = ctx.CallbackQuery.Answer(b, nil)
+		return nil
+
+	case strings.HasPrefix(data, "grpdelyes|"):
+		gid := mustAtoi64(strings.TrimPrefix(data, "grpdelyes|gid:"))
+		if err := a.repo.deleteGroup(gid); err == nil {
+			_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Группа удалена"})
+			// back to my groups first page
+			markup, _, _ := a.buildGroupsPageKeyboard(uid, 0, "mg")
+			_, _ = ctx.EffectiveChat.SendMessage(b, "Группа удалена. Ваши группы:", &tgb.SendMessageOpts{ReplyMarkup: markup})
+			return nil
+		}
+		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Ошибка удаления группы"})
+		return nil
 	}
 
 	// add-expense flow callbacks
@@ -1032,7 +1085,7 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 	if !ok {
 		_, _ = ctx.CallbackQuery.Answer(b, nil)
 		return nil
-}
+	}
 	switch {
 	case strings.HasPrefix(data, "payer|"):
 		idStr := strings.TrimPrefix(data, "payer|")
@@ -1213,18 +1266,14 @@ func (a *app) onBalances(b *tgb.Bot, ctx *ext.Context) error {
 	return nil
 }
 
-// Новое: /join <group_id>
+// /join <code>
 func (a *app) onJoin(b *tgb.Bot, ctx *ext.Context) error {
 	if len(ctx.Args()) != 1 {
-		_, _ = ctx.EffectiveChat.SendMessage(b, "Использование: /join <group_id>", nil)
+		_, _ = ctx.EffectiveChat.SendMessage(b, "Использование: /join <код>\nТакже можно: /join_<код> или ссылка /start <код>", nil)
 		return nil
 	}
-	gid, err := strconv.ParseInt(ctx.Args()[0], 10, 64)
-	if err != nil {
-		_, _ = ctx.EffectiveChat.SendMessage(b, "Некорректный group_id", nil)
-		return nil
-	}
-	if title, err := a.repo.joinByGroupID(gid, ctx.EffectiveUser.Id); err == nil {
+	code := ctx.Args()[0]
+	if gid, title, err := a.repo.joinByCode(code, ctx.EffectiveUser.Id); err == nil {
 		_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
 		return nil
 	} else {
