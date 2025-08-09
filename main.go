@@ -401,6 +401,7 @@ func (r *repo) deleteExpense(expenseID int64) error {
 type pair struct{ From, To int64 }
 
 func (r *repo) computeGroupBalances(groupID int64) (map[pair]int64, error) {
+	// 1) Собираем все траты
 	rows, err := r.db.Query(`
 SELECT e.id, e.payer_tg_id, e.amount_cents
 FROM expenses e
@@ -425,6 +426,7 @@ WHERE e.group_id=? AND e.deleted=0
 		exps = append(exps, x)
 	}
 
+	// Доли по тратам
 	sharesByExp := map[int64]map[int64]int64{}
 	for _, e := range exps {
 		pr, err := r.db.Query(`SELECT participant_tg_id,share_cents FROM expense_participants WHERE expense_id=?`, e.id)
@@ -444,6 +446,7 @@ WHERE e.group_id=? AND e.deleted=0
 		sharesByExp[e.id] = m
 	}
 
+	// 2) Считаем «кто кому должен» из трат
 	bal := map[pair]int64{}
 	for _, e := range exps {
 		for uid, s := range sharesByExp[e.id] {
@@ -453,19 +456,59 @@ WHERE e.group_id=? AND e.deleted=0
 			bal[pair{From: uid, To: e.payer}] += s
 		}
 	}
-	// Net pairs
+
+	// 3) Применяем подтверждённые оплаты (settlements)
+	//    Оплата уменьшает долг From -> To. Если оплаты больше, остаток
+	//    разворачивается как долг в обратную сторону.
+	setRows, err := r.db.Query(`
+SELECT from_tg_id, to_tg_id, amount_cents
+FROM settlements
+WHERE group_id=? AND confirmed_by_to=1
+`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer setRows.Close()
+
+	for setRows.Next() {
+		var from, to, amt int64
+		if err := setRows.Scan(&from, &to, &amt); err != nil {
+			return nil, err
+		}
+		k := pair{From: from, To: to}
+		cur := bal[k]
+		if cur >= amt {
+			bal[k] = cur - amt
+			if bal[k] == 0 {
+				delete(bal, k)
+			}
+		} else {
+			over := amt - cur
+			delete(bal, k)
+			// Переплата превращается в долг получателя перед плательщиком
+			if over > 0 {
+				bal[pair{From: to, To: from}] += over
+			}
+		}
+	}
+
+	// 4) Финальное взаимозачётное схлопывание пар
 	for k := range bal {
 		inv := pair{From: k.To, To: k.From}
 		if v2, ok := bal[inv]; ok {
 			if bal[k] >= v2 {
 				bal[k] = bal[k] - v2
 				delete(bal, inv)
+				if bal[k] == 0 {
+					delete(bal, k)
+				}
 			} else {
 				bal[inv] = v2 - bal[k]
 				delete(bal, k)
 			}
 		}
 	}
+
 	return bal, nil
 }
 
