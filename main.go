@@ -977,8 +977,7 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 		if amt > remaining {
 			editOrSend(b, ctx,
 				fmt.Sprintf("Слишком много. Остаток — %s. Введите сумму для %s не больше остатка.",
-					formatCents(remaining), name), inlineCancel()
-				)
+					formatCents(remaining), name), inlineCancel())
 			return nil
 		}
 		// Для последнего участника — автодобивание остатка.
@@ -998,14 +997,12 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 		progress := "Назначено:\n• " + strings.Join(parts, "\n• ")
 
 		if len(st.CustomLeft) == 0 {
-			editOrSend(b, ctx, progress+"\nВсе суммы заданы. Сохраняю…", inlineCancel()
-		)
+			editOrSend(b, ctx, progress+"\nВсе суммы заданы. Сохраняю…", inlineCancel())
 			return a.finalizeExpense(b, ctx, st)
 		}
 		next := st.CustomLeft[0]
 		editOrSend(b, ctx, fmt.Sprintf("%s\n\nВведите сумму для участника %s (остаток — %s):",
-			progress, a.repo.userName(next), formatCents(st.AmountCents-sumMap(st.CustomShares))), inlineCancel()
-		)
+			progress, a.repo.userName(next), formatCents(st.AmountCents-sumMap(st.CustomShares))), inlineCancel())
 		return nil
 	}
 
@@ -1035,8 +1032,7 @@ func (a *app) askNextCustom(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) e
 	editOrSend(b, ctx,
 		fmt.Sprintf("%sВведите сумму для участника %s (остаток — %s, максимум — %s):",
 			progress, name, formatCents(remaining), formatCents(remaining)),
-		inlineCancel()
-	)
+		inlineCancel())
 	return nil
 }
 
