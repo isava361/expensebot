@@ -936,12 +936,18 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 	case "await_amount_desc":
 		parts := strings.Fields(txt)
 		if len(parts) == 0 {
-			_, _ = ctx.EffectiveChat.SendMessage(b, "Нужно прислать сумму и описание. Пример: 1200 обед", inlineCancel())
+			_, _ = ctx.EffectiveChat.SendMessage(b,
+				"Нужно прислать сумму и описание. Пример: 1200 обед",
+				&tgb.SendMessageOpts{ReplyMarkup: inlineCancel()},
+			)
 			return nil
 		}
 		amt, err := centsFromStr(parts[0])
 		if err != nil || amt <= 0 {
-			_, _ = ctx.EffectiveChat.SendMessage(b, "Сумма не распознана. Пример: 1200 обед", inlineCancel())
+			_, _ = ctx.EffectiveChat.SendMessage(b,
+				"Сумма не распознана. Пример: 1200 обед",
+				&tgb.SendMessageOpts{ReplyMarkup: inlineCancel()},
+			)
 			return nil
 		}
 		st.AmountCents = amt
