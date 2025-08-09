@@ -315,7 +315,7 @@ func (r *repo) listMembers(groupID int64) ([]struct{ ID int64; Name string }, er
 func (r *repo) getInviteCode(groupID int64) (string, error) {
 	var code string
 	err := r.db.QueryRow(`SELECT invite_code FROM groups WHERE id=?`, groupID).Scan(&code)
-	return err, err
+	return code, err
 }
 
 func (r *repo) isGroupOwner(groupID, uid int64) (bool, error) {
