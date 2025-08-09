@@ -667,8 +667,7 @@ func (a *app) onCancel(b *tgb.Bot, ctx *ext.Context) error {
 
 func getBestName(ctx *ext.Context) string {
 	u := ctx.EffectiveUser
-	if u.Username != ""
-	{
+	if u.Username != "" {
 		return "@" + u.Username
 	}
 	if u.FirstName != "" || u.LastName != "" {
