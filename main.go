@@ -34,6 +34,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"html"
 
 	tgb "github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
