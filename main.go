@@ -941,7 +941,7 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 		// гиперссылка на /join <код> для пересылки в другой чат
 		shareText := url.QueryEscape("/join " + code)
 		shareText = strings.ReplaceAll(shareText, "+", "%20")
-		shareHref := fmt.Sprintf("https://t.me/share/url?text=%s", shareText) 
+		shareHref := fmt.Sprintf("https://t.me/share/url?url=%s", shareText) 
 		htmlJoin := fmt.Sprintf(`<a href="%s">/join %s</a>`, shareHref, code)
 
 
@@ -1372,7 +1372,7 @@ func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) erro
 	txt := "/join " + code
 	enc := url.QueryEscape(txt)
 	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("https://t.me/share/url?text=%s", enc) 	
+	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc) 	
 
 	rows := [][]tgb.InlineKeyboardButton{
 		{{Text: "Поделиться /join…", Url: share}},
@@ -1408,7 +1408,7 @@ func (a *app) sendInviteForGroupEdit(b *tgb.Bot, ctx *ext.Context, gid int64) er
 	txt := "/join " + code
 	enc := url.QueryEscape(txt)
 	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("https://t.me/share/url?text=%s", enc)	
+	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)	
 
 	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: /join %s", gid, code)
 	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
