@@ -819,6 +819,7 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 
 func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseState, txt string) error {
 	uid := ctx.EffectiveUser.Id
+
 	switch st.Step {
 	case "await_amount_desc":
 		parts := strings.Fields(txt)
@@ -840,36 +841,100 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 		st.Step = "choose_payer"
 		a.state.Set(uid, st)
 		return a.askPayer(b, ctx, st)
+
 	case "await_custom_share":
+		// страховка
+		if st.CustomShares == nil {
+			st.CustomShares = map[int64]int64{}
+		}
 		if len(st.CustomLeft) == 0 {
+			// на всякий — завершаем
 			st.Step = "confirm"
 			a.state.Set(uid, st)
 			return a.finalizeExpense(b, ctx, st)
 		}
-		nextUID := st.CustomLeft[0]
-		amt, err := centsFromStr(txt)
+
+		// парсим
+		amt, err := centsFromStr(strings.TrimSpace(txt))
 		if err != nil || amt < 0 {
 			editOrSend(b, ctx, "Сумма не распознана. Пришлите число, напр. 350.50", nil)
 			return nil
 		}
+
+		nextUID := st.CustomLeft[0]
+		name := a.repo.userName(nextUID)
+		remaining := st.AmountCents - sumMap(st.CustomShares)
+
+		// проверки
+		if amt > remaining {
+			editOrSend(b, ctx,
+				fmt.Sprintf("Слишком много. Остаток — %s. Введите сумму для %s не больше остатка.",
+					formatCents(remaining), name), nil)
+			return nil
+		}
+		if len(st.CustomLeft) == 1 && amt != remaining {
+			editOrSend(b, ctx,
+				fmt.Sprintf("Для последнего участника сумма должна быть ровно %s. Попробуйте ещё раз для %s.",
+					formatCents(remaining), name), nil)
+			return nil
+		}
+
+		// записываем
 		st.CustomShares[nextUID] = amt
 		st.CustomLeft = st.CustomLeft[1:]
 		a.state.Set(uid, st)
+
+		// показываем прогресс
+		var parts []string
+		for pid, v := range st.CustomShares {
+			parts = append(parts, fmt.Sprintf("%s: %s", a.repo.userName(pid), formatCents(v)))
+		}
+		sort.Strings(parts)
+		progress := "Назначено:\n• " + strings.Join(parts, "\n• ")
+
+		// дальше
 		if len(st.CustomLeft) == 0 {
-			sum := int64(0)
-			for _, v := range st.CustomShares {
-				sum += v
-			}
-			if sum != st.AmountCents {
-				editOrSend(b, ctx, fmt.Sprintf("Сумма долей %s ≠ общей суммы %s. Пришлите /cancel и начните заново или исправьте последнюю сумму.", formatCents(sum), formatCents(st.AmountCents)), nil)
-				return nil
-			}
+			editOrSend(b, ctx, progress+"\nВсе суммы заданы. Сохраняю…", nil)
 			return a.finalizeExpense(b, ctx, st)
 		}
-		return a.askNextCustom(b, ctx, st)
+		// спрашиваем следующего
+		next := st.CustomLeft[0]
+		editOrSend(b, ctx, fmt.Sprintf("%s\n\nВведите сумму для участника %s (остаток — %s):",
+			progress, a.repo.userName(next), formatCents(st.AmountCents-sumMap(st.CustomShares))), nil)
+		return nil
 	}
+
 	return nil
 }
+
+func (a *app) askNextCustom(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error {
+	if len(st.CustomLeft) == 0 {
+		return a.finalizeExpense(b, ctx, st)
+	}
+	// страховка
+	if st.CustomShares == nil {
+		st.CustomShares = map[int64]int64{}
+	}
+	uid := st.CustomLeft[0]
+	name := a.repo.userName(uid)
+	remaining := st.AmountCents - sumMap(st.CustomShares)
+
+	// Подсказка с максимумом и кто уже назначен.
+	var parts []string
+	for pid, v := range st.CustomShares {
+		parts = append(parts, fmt.Sprintf("%s: %s", a.repo.userName(pid), formatCents(v)))
+	}
+	sort.Strings(parts)
+	progress := ""
+	if len(parts) > 0 {
+		progress = "Назначено:\n• " + strings.Join(parts, "\n• ") + "\n\n"
+	}
+	editOrSend(b, ctx,
+		fmt.Sprintf("%sВведите сумму для участника %s (остаток — %s, максимум — %s):",
+			progress, name, formatCents(remaining), formatCents(remaining)), nil)
+	return nil
+}
+
 
 // ---------- Callback router (only edits) ----------
 
@@ -1251,16 +1316,6 @@ func (a *app) askSplitMode(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) er
 	return nil
 }
 
-func (a *app) askNextCustom(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error {
-	if len(st.CustomLeft) == 0 {
-		return a.finalizeExpense(b, ctx, st)
-	}
-	uid := st.CustomLeft[0]
-	name := a.repo.userName(uid)
-	editOrSend(b, ctx, fmt.Sprintf("Введите сумму для участника %s (остаток — %s):",
-		name, formatCents(st.AmountCents-sumMap(st.CustomShares))), nil)
-	return nil
-}
 
 func sumMap(m map[int64]int64) int64 {
 	var s int64
