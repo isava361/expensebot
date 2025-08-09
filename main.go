@@ -980,7 +980,7 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		return nil
 
 	// selections
-	case stringsHasPrefix(data, "mgsel|"):
+	case strings.HasPrefix(data, "mgsel|"):
 		gid := mustAtoi64(strings.TrimPrefix(data, "mgsel|"))
 		_ = a.sendGroupDetailsEdit(b, ctx, gid)
 		_, _ = ctx.CallbackQuery.Answer(b, nil)
