@@ -1410,7 +1410,7 @@ func (a *app) sendInviteForGroupEdit(b *tgb.Bot, ctx *ext.Context, gid int64) er
 	enc = strings.ReplaceAll(enc, "+", "%20")
 	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)	
 
-	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: /join %s", gid, code)
+	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: %s", gid, share)
 	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
 		{{Text: "Поделиться /join…", Url: share}},
 	}})
