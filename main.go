@@ -1408,9 +1408,10 @@ func (a *app) sendInviteForGroupEdit(b *tgb.Bot, ctx *ext.Context, gid int64) er
 	txt := "/join " + code
 	enc := url.QueryEscape(txt)
 	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)	
+	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)
+	htmlJoin := fmt.Sprintf(`<a href="%s">/join %s</a>`, share, code)	
 
-	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: %s", gid, share)
+	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: %s", gid, htmlJoin)
 	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
 		{{Text: "Поделиться /join…", Url: share}},
 	}})
