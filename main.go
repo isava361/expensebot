@@ -715,12 +715,17 @@ func (a *app) buildGroupsPageKeyboard(uid int64, page int, mode string) (*tgb.In
 
 func editOrSend(b *tgb.Bot, ctx *ext.Context, text string, markup *tgb.InlineKeyboardMarkup) {
 	if ctx.CallbackQuery != nil && ctx.CallbackQuery.Message != nil {
-		_, _ = ctx.CallbackQuery.Message.EditText(b, text, &tgb.EditMessageTextOpts{ReplyMarkup: markup})
-	} else {
-		msg, _ := ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{ReplyMarkup: markup, ReplyToMessageId: 0})
-		if msg != nil {
-			ctx.BotData.Store("last_msg_id", msg.MessageId)
+		if markup != nil {
+			_, _, _ = ctx.CallbackQuery.Message.EditText(b, text, &tgb.EditMessageTextOpts{
+				ReplyMarkup: *markup, // разыменовали: значение, не указатель
+			})
+		} else {
+			_, _, _ = ctx.CallbackQuery.Message.EditText(b, text, nil)
 		}
+	} else {
+		_, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
+			ReplyMarkup: markup, // ok: интерфейс ReplyMarkup принимает *InlineKeyboardMarkup
+		})
 	}
 }
 
