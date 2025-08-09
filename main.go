@@ -1,20 +1,16 @@
 package main
 
-// Telegram expense-splitting bot using gotgbot + SQLite (pure Go driver)
-// Updated features per request:
-// - /mygroups: paginated inline keyboard; on select shows group balances (who YOU owe),
-//   invite link, buttons to view expenses (paginated) and go back.
-// - /invite: paginated groups; on select sends invite link.
-// - /addexpense: paginated groups; on select starts add-expense flow for that group.
-// - /balances: shows, per group, whom YOU owe and how much.
-// - Remove /confirm and /delexpense commands; those are now inline flows.
-// - Inline actions: delete expense, "confirm payment" (records a settlement for full debt amount).
+// Expense-splitting Telegram bot (gotgbot v2 + SQLite, pure Go).
+// Изменения:
+// - Инвайт по ссылке: https://t.me/<bot>?start=join_<GROUP_ID>
+// - Команда /join <group_id>
+// - /mygroups, /invite, /addexpense — с пагинацией по группам
+// - Детали группы: балансы (кому ТЫ должен), инвайт-ссылка, список трат (пагинация), удаление траты, подтверждение оплаты
+// - /balances: сводка "кому ты должен" по всем группам
 //
-// Env:
+// ENV:
 //   BOT_TOKEN=<telegram bot token>
 //   DB_PATH=./data.db
-//
-// DB: modernc.org/sqlite (pure Go)
 
 import (
 	"context"
@@ -100,7 +96,7 @@ CREATE TABLE IF NOT EXISTS expense_participants(
 
 CREATE TABLE IF NOT EXISTS settlements(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER, -- nullable => cross-group
+    group_id INTEGER,
     from_tg_id INTEGER NOT NULL,
     to_tg_id INTEGER NOT NULL,
     amount_cents INTEGER NOT NULL,
@@ -246,6 +242,17 @@ func (r *repo) joinByCode(code string, uid int64) (int64, string, error) {
 	return gid, title, err
 }
 
+// Новое: join по group_id
+func (r *repo) joinByGroupID(gid int64, uid int64) (string, error) {
+	var title string
+	if err := r.db.QueryRow(`SELECT title FROM groups WHERE id=?`, gid).Scan(&title); err != nil {
+		return "", err
+	}
+	_, err := r.db.Exec(`INSERT INTO group_members(group_id,tg_id,role) VALUES(?,?,?)
+		ON CONFLICT(group_id,tg_id) DO NOTHING`, gid, uid, "member")
+	return title, err
+}
+
 func (r *repo) listUserGroups(uid int64) ([]struct{ ID int64; Title string }, error) {
 	rows, err := r.db.Query(`SELECT g.id,g.title FROM groups g
 		JOIN group_members m ON g.id=m.group_id
@@ -311,7 +318,7 @@ func (r *repo) createExpenseTx(ctx context.Context, st *addExpenseState) (int64,
 	if st.SplitMode == "equal" {
 		shares = map[int64]int64{}
 		var count int64 = 0
-		for _, on := range st.Participants { // <- unused pid removed
+		for _, on := range st.Participants { // pid не нужен
 			if on {
 				count++
 			}
@@ -561,6 +568,7 @@ func main() {
 	dispatcher.AddHandler(handlers.NewCommand("invite", a.onInvite))
 	dispatcher.AddHandler(handlers.NewCommand("addexpense", a.onAddExpense))
 	dispatcher.AddHandler(handlers.NewCommand("balances", a.onBalances))
+	dispatcher.AddHandler(handlers.NewCommand("join", a.onJoin)) // новое
 
 	// Inline callbacks & text
 	dispatcher.AddHandler(handlers.NewCallback(callbackquery.All, a.cb))
@@ -580,12 +588,23 @@ func (a *app) onStart(b *tgb.Bot, ctx *ext.Context) error {
 	name := getBestName(ctx)
 	_ = a.repo.upsertUser(uid, name)
 
+	// Deep-link обработка
 	args := ctx.Args()
 	if len(args) == 1 {
-		code := args[0]
-		if gid, title, err := a.repo.joinByCode(code, uid); err == nil {
-			_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
-			return nil
+		p := args[0]
+		switch {
+		case strings.HasPrefix(p, "join_"):
+			gid, _ := strconv.ParseInt(strings.TrimPrefix(p, "join_"), 10, 64)
+			if title, err := a.repo.joinByGroupID(gid, uid); err == nil {
+				_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
+				return nil
+			}
+		default:
+			// совместимость со старыми кодами
+			if gid, title, err := a.repo.joinByCode(p, uid); err == nil {
+				_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
+				return nil
+			}
 		}
 	}
 
@@ -595,7 +614,8 @@ func (a *app) onStart(b *tgb.Bot, ctx *ext.Context) error {
 		"/mygroups — группы и детали\n" +
 		"/invite — получить инвайт-ссылку для группы\n" +
 		"/addexpense — добавить трату (сначала выбери группу)\n" +
-		"/balances — кому ты должен по группам"
+		"/balances — кому ты должен по группам\n" +
+		"/join <group_id> — присоединиться к группе"
 	_, _ = ctx.EffectiveChat.SendMessage(b, msg, nil)
 	return nil
 }
@@ -623,8 +643,10 @@ func (a *app) onNewGroup(b *tgb.Bot, ctx *ext.Context) error {
 	if err != nil {
 		return err
 	}
-	link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
-	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d создана: %s\nПриглашение: %s", gid, title, link), nil)
+	// оставляем старую ссылку + показываем новую (join_gid)
+	oldLink := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
+	newLink := fmt.Sprintf("https://t.me/%s?start=join_%d", a.base, gid)
+	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d создана: %s\nСтарая ссылка: %s\nНовая ссылка: %s", gid, title, oldLink, newLink), nil)
 	return nil
 }
 
@@ -634,7 +656,7 @@ const groupsPerPage = 5
 const expensesPerPage = 10
 
 func (a *app) buildGroupsPageKeyboard(uid int64, page int, mode string) (*tgb.InlineKeyboardMarkup, int, error) {
-	// mode in {"mg","inv","ae"}  (mygroups, invite, addexpense)
+	// mode in {"mg","inv","ae"}
 	gs, err := a.repo.listUserGroups(uid)
 	if err != nil {
 		return nil, 0, err
@@ -725,33 +747,28 @@ func (a *app) onAddExpense(b *tgb.Bot, ctx *ext.Context) error {
 
 func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 	uid := ctx.EffectiveUser.Id
-	// invite link
-	code, err := a.repo.getInviteCode(gid)
-	if err != nil {
-		return err
-	}
-	link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
 
-	// balances (show only where YOU owe)
+	// Новая join-ссылка
+	link := fmt.Sprintf("https://t.me/%s?start=join_%d", a.base, gid)
+
+	// balances (только где ТЫ должник)
 	bal, err := a.repo.computeGroupBalances(gid)
 	if err != nil {
 		return err
 	}
-	var lines []string
 	type debt struct {
 		To   int64
 		Amnt int64
 	}
 	var debts []debt
 	for k, v := range bal {
-		if v <= 0 || k.From != uid {
-			continue
+		if v > 0 && k.From == uid {
+			debts = append(debts, debt{To: k.To, Amnt: v})
 		}
-		debts = append(debts, debt{To: k.To, Amnt: v})
 	}
-	// sort largest first
 	sort.Slice(debts, func(i, j int) bool { return debts[i].Amnt > debts[j].Amnt })
 
+	var lines []string
 	lines = append(lines, fmt.Sprintf("Группа #%d", gid))
 	lines = append(lines, fmt.Sprintf("Приглашение: %s", link))
 	if len(debts) == 0 {
@@ -760,19 +777,19 @@ func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 		lines = append(lines, "Ваши долги по группе:")
 	}
 
-	// keyboard: expenses / back, and per-debt confirm buttons
+	// keyboard
 	rows := [][]tgb.InlineKeyboardButton{
 		{{Text: "Список трат", CallbackData: fmt.Sprintf("explist|%d|p:%d", gid, 0)}},
 		{{Text: "Назад к моим группам", CallbackData: "mg|p:0"}},
 	}
 
-	// Add per-debt "Подтвердить оплату"
+	// per-debt confirm
 	for _, d := range debts {
 		btn := tgb.InlineKeyboardButton{
 			Text:         fmt.Sprintf("Подтвердить оплату → %s (%s)", a.repo.userName(d.To), formatCents(d.Amnt)),
 			CallbackData: fmt.Sprintf("pay|gid:%d|to:%d|amt:%d", gid, d.To, d.Amnt),
 		}
-		rows = append([][]tgb.InlineKeyboardButton{ {btn} }, rows...) // put confirmations above
+		rows = append([][]tgb.InlineKeyboardButton{{btn}}, rows...)
 		lines = append(lines, fmt.Sprintf("Вы должны %s: %s", a.repo.userName(d.To), formatCents(d.Amnt)))
 	}
 
@@ -783,12 +800,13 @@ func (a *app) sendGroupDetails(b *tgb.Bot, ctx *ext.Context, gid int64) error {
 }
 
 func (a *app) sendInviteForGroup(b *tgb.Bot, ctx *ext.Context, gid int64) error {
-	code, err := a.repo.getInviteCode(gid)
-	if err != nil {
-		return err
-	}
-	link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
-	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Приглашение в группу #%d:\n%s", gid, link), nil)
+	url := fmt.Sprintf("https://t.me/%s?start=join_%d", a.base, gid)
+	text := fmt.Sprintf("Приглашение в группу #%d:\n%s", gid, url)
+	_, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
+		ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
+			{{Text: "Открыть бота по ссылке", Url: url}},
+		}},
+	})
 	return nil
 }
 
@@ -823,13 +841,11 @@ func (a *app) sendExpensesPage(b *tgb.Bot, ctx *ext.Context, gid int64, page int
 			it.ID, it.Desc, formatCents(it.AmountCents), a.repo.userName(it.Payer)))
 	}
 	rows := [][]tgb.InlineKeyboardButton{}
-	// Row with delete buttons (one per item)
 	for _, it := range items {
 		rows = append(rows, []tgb.InlineKeyboardButton{
 			{Text: fmt.Sprintf("Удалить #%d", it.ID), CallbackData: fmt.Sprintf("expdel|%d|gid:%d|p:%d", it.ID, gid, page)},
 		})
 	}
-	// Nav
 	nav := []tgb.InlineKeyboardButton{
 		{Text: "Назад к группе", CallbackData: fmt.Sprintf("mgsel|%d", gid)},
 	}
@@ -914,8 +930,8 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 	data := ctx.CallbackQuery.Data
 	uid := ctx.EffectiveUser.Id
 
-	// Pagination for groups
 	switch {
+	// paging: groups
 	case strings.HasPrefix(data, "mg|p:"):
 		page := mustAtoi(strings.TrimPrefix(data, "mg|p:"))
 		markup, _, err := a.buildGroupsPageKeyboard(uid, page, "mg")
@@ -941,7 +957,7 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		_, _ = ctx.CallbackQuery.Answer(b, nil)
 		return nil
 
-	// Selections
+	// selections
 	case strings.HasPrefix(data, "mgsel|"):
 		gid := mustAtoi64(strings.TrimPrefix(data, "mgsel|"))
 		_ = a.sendGroupDetails(b, ctx, gid)
@@ -954,30 +970,27 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		return nil
 	case strings.HasPrefix(data, "aesel|"):
 		gid := mustAtoi64(strings.TrimPrefix(data, "aesel|"))
-		// Start add-expense flow
 		a.state.Set(uid, &addExpenseState{
 			GroupID:      gid,
 			Participants: map[int64]bool{},
 			CustomShares: map[int64]int64{},
 			Step:         "await_amount_desc",
 		})
-		_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d выбрана. Пришлите сумму и описание в одном сообщении, например:\n1500 такси из аэропорта", gid), nil)
+		_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d выбрана. Пришлите сумму и описание одним сообщением, напр.:\n1500 такси из аэропорта", gid), nil)
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Группа выбрана"})
 		return nil
 
-	// Expenses list nav
+	// expenses
 	case strings.HasPrefix(data, "explist|"):
-		// explist|<gid>|p:<n>
-		parts := strings.Split(data, "|")
+		parts := strings.Split(data, "|") // explist|<gid>|p:<n>
 		if len(parts) >= 3 && strings.HasPrefix(parts[2], "p:") {
-			gid := mustAtoi64(strings.TrimPrefix(parts[1], ""))
+			gid := mustAtoi64(parts[1])
 			page := mustAtoi(strings.TrimPrefix(parts[2], "p:"))
 			_ = a.sendExpensesPage(b, ctx, gid, page)
 		}
 		_, _ = ctx.CallbackQuery.Answer(b, nil)
 		return nil
 
-	// Delete expense
 	case strings.HasPrefix(data, "expdel|"):
 		// expdel|<eid>|gid:<gid>|p:<page>
 		parts := strings.Split(data, "|")
@@ -987,14 +1000,14 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 			page := mustAtoi(strings.TrimPrefix(parts[3], "p:"))
 			if err := a.repo.deleteExpense(eid); err == nil {
 				_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Удалено"})
-				_ = a.sendExpensesPage(b, ctx, gid, page) // refresh
+				_ = a.sendExpensesPage(b, ctx, gid, page)
 				return nil
 			}
 		}
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Ошибка удаления"})
 		return nil
 
-	// Confirm payment for full debt amount
+	// confirm payment
 	case strings.HasPrefix(data, "pay|"):
 		// pay|gid:<gid>|to:<uid>|amt:<cents>
 		parts := strings.Split(data, "|")
@@ -1002,12 +1015,11 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 			gid := mustAtoi64(strings.TrimPrefix(parts[1], "gid:"))
 			to := mustAtoi64(strings.TrimPrefix(parts[2], "to:"))
 			amt := mustAtoi64(strings.TrimPrefix(parts[3], "amt:"))
-			// Record settlement as confirmed (MVP)
 			_, err := a.db.Exec(`INSERT INTO settlements(group_id,from_tg_id,to_tg_id,amount_cents,confirmed_by_to,created_at)
 				VALUES(?,?,?,?,?,?)`, gid, uid, to, amt, 1, nowUnix())
 			if err == nil {
 				_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Оплата подтверждена"})
-				_ = a.sendGroupDetails(b, ctx, gid) // refresh balances
+				_ = a.sendGroupDetails(b, ctx, gid)
 				return nil
 			}
 		}
@@ -1015,12 +1027,12 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 		return nil
 	}
 
-	// Add-expense flow callbacks (payer/participants/split)
+	// add-expense flow callbacks
 	st, ok := a.state.Get(uid)
 	if !ok {
 		_, _ = ctx.CallbackQuery.Answer(b, nil)
 		return nil
-	}
+}
 	switch {
 	case strings.HasPrefix(data, "payer|"):
 		idStr := strings.TrimPrefix(data, "payer|")
@@ -1199,4 +1211,23 @@ func (a *app) onBalances(b *tgb.Bot, ctx *ext.Context) error {
 	}
 	_, _ = ctx.EffectiveChat.SendMessage(b, sb.String(), nil)
 	return nil
+}
+
+// Новое: /join <group_id>
+func (a *app) onJoin(b *tgb.Bot, ctx *ext.Context) error {
+	if len(ctx.Args()) != 1 {
+		_, _ = ctx.EffectiveChat.SendMessage(b, "Использование: /join <group_id>", nil)
+		return nil
+	}
+	gid, err := strconv.ParseInt(ctx.Args()[0], 10, 64)
+	if err != nil {
+		_, _ = ctx.EffectiveChat.SendMessage(b, "Некорректный group_id", nil)
+		return nil
+	}
+	if title, err := a.repo.joinByGroupID(gid, ctx.EffectiveUser.Id); err == nil {
+		_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title), nil)
+		return nil
+	} else {
+		return err
+	}
 }
