@@ -46,6 +46,7 @@ import (
 // ---------- small helpers ----------
 
 func sp(s string) *string { return &s } // string pointer helper
+func bp(b bool) *bool     { return &b } // bool pointer helper
 
 // ---------- DB ----------
 
@@ -947,10 +948,12 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 
 		text := fmt.Sprintf("Группа #%d создана: %s\nПриглашение: %s\nКоманда: %s",
 			gid, title, link, htmlJoin)
+
+		// ВАЖНО: вместо устаревшего DisableWebPagePreview используем LinkPreviewOptions
 		_, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
-			ReplyMarkup: mainKeyboard(),
-			ParseMode:   tgb.ParseModeHTML,
-			DisableWebPagePreview: true,
+			ReplyMarkup:        mainKeyboard(),
+			ParseMode:          tgb.ParseModeHTML,
+			LinkPreviewOptions: &tgb.LinkPreviewOptions{IsDisabled: bp(true)},
 		})
 		return nil
 	}
@@ -1007,6 +1010,7 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 
 	return nil
 }
+
 
 func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseState, txt string) error {
 	uid := ctx.EffectiveUser.Id
