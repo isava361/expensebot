@@ -1048,12 +1048,13 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 
 	switch {
 		
-	case data == "cancel_flow":
-        a.state.Del(uid)            // drop add-expense state if any
+    case data == "cancel_flow":
+        a.state.Del(uid)
         a.state.SetNewGroup(uid, false)
         editOrSend(b, ctx, "Отменено. Что дальше?", nil)
         _, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Отменено"})
         return nil
+
 	// paging: groups
 	case strings.HasPrefix(data, "mg|p:"):
 		page := mustAtoi(strings.TrimPrefix(data, "mg|p:"))
