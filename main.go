@@ -1325,98 +1325,141 @@ func mustAtoi64(s string) int64 {
 // ---------- Screens (EDIT variants) ----------
 
 func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) error {
-	uid := ctx.EffectiveUser.Id
+    uid := ctx.EffectiveUser.Id
 
-	code, err := a.repo.getInviteCode(gid)
-	if err != nil {
-		return err
-	}
+    code, err := a.repo.getInviteCode(gid)
+    if err != nil {
+        return err
+    }
+    bal, err := a.repo.computeGroupBalances(gid)
+    if err != nil {
+        return err
+    }
 
-	bal, err := a.repo.computeGroupBalances(gid)
-	if err != nil {
-		return err
-	}
+    // Кликабельная команда /join <code>
+    cmd := "/join " + code
+    enc := url.QueryEscape(cmd)
+    enc = strings.ReplaceAll(enc, "+", "%20")
+    share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)
+    cmdHTML := fmt.Sprintf(`<a href="%s">%s</a>`, share, html.EscapeString(cmd))
 
-	var youOwe, oweYou []string
-	for k, v := range bal {
-		if v <= 0 {
-			continue
-		}
-		switch {
-		case k.From == uid:
-			youOwe = append(youOwe, fmt.Sprintf("вы → %s: %s", a.repo.userName(k.To), formatCents(v)))
-		case k.To == uid:
-			oweYou = append(oweYou, fmt.Sprintf("%s → вам: %s", a.repo.userName(k.From), formatCents(v)))
-		}
-	}
-	sort.Strings(youOwe)
-	sort.Strings(oweYou)
+    // Списки долгов (экранируем имена на всякий случай)
+    var youOwe, oweYou []string
+    for k, v := range bal {
+        if v <= 0 {
+            continue
+        }
+        switch {
+        case k.From == uid:
+            youOwe = append(youOwe, fmt.Sprintf("вы → %s: %s", html.EscapeString(a.repo.userName(k.To)), formatCents(v)))
+        case k.To == uid:
+            oweYou = append(oweYou, fmt.Sprintf("%s → вам: %s", html.EscapeString(a.repo.userName(k.From)), formatCents(v)))
+        }
+    }
+    sort.Strings(youOwe)
+    sort.Strings(oweYou)
 
-	var lines []string
-	lines = append(lines, fmt.Sprintf("Группа #%d", gid))
-	lines = append(lines, fmt.Sprintf("Команда: /join %s", code))
-	if len(youOwe) == 0 && len(oweYou) == 0 {
-		lines = append(lines, "В этой группе долгов нет 🎉")
-	} else {
-		if len(youOwe) > 0 {
-			lines = append(lines, "Вы должны:")
-			lines = append(lines, "• "+strings.Join(youOwe, "\n• "))
-		}
-		if len(oweYou) > 0 {
-			lines = append(lines, "Вам должны:")
-			lines = append(lines, "• "+strings.Join(oweYou, "\n• "))
-		}
-	}
+    var sb strings.Builder
+    sb.WriteString(fmt.Sprintf("Группа #%d\n", gid))
+    sb.WriteString(fmt.Sprintf("Команда: %s\n", cmdHTML))
+    if len(youOwe) == 0 && len(oweYou) == 0 {
+        sb.WriteString("В этой группе долгов нет 🎉")
+    } else {
+        if len(youOwe) > 0 {
+            sb.WriteString("Вы должны:\n• " + strings.Join(youOwe, "\n• ") + "\n")
+        }
+        if len(oweYou) > 0 {
+            sb.WriteString("Вам должны:\n• " + strings.Join(oweYou, "\n• "))
+        }
+    }
+    text := sb.String()
 
-	// Кнопка «Поделиться /join…» — открывает выбор чата с правильным пробелом.
-	txt := "/join " + code
-	enc := url.QueryEscape(txt)
-	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc) 	
+    // Кнопки
+    rows := [][]tgb.InlineKeyboardButton{
+        {{Text: "Поделиться /join…", Url: share}},
+        {{Text: "Список трат", CallbackData: fmt.Sprintf("explist|%d|p:%d", gid, 0)}},
+    }
+    if isOwner, _ := a.repo.isGroupOwner(gid, uid); isOwner {
+        rows = append(rows, []tgb.InlineKeyboardButton{
+            {Text: "🗑 Удалить группу", CallbackData: fmt.Sprintf("grpdel|gid:%d", gid)},
+        })
+    }
+    rows = append(rows, []tgb.InlineKeyboardButton{{Text: "Назад к моим группам", CallbackData: "mg|p:0"}})
 
-	rows := [][]tgb.InlineKeyboardButton{
-		{{Text: "Поделиться /join…", Url: share}},
-		{{Text: "Список трат", CallbackData: fmt.Sprintf("explist|%d|p:%d", gid, 0)}},
-	}
-	if isOwner, _ := a.repo.isGroupOwner(gid, uid); isOwner {
-		rows = append(rows, []tgb.InlineKeyboardButton{
-			{Text: "🗑 Удалить группу", CallbackData: fmt.Sprintf("grpdel|gid:%d", gid)},
-		})
-	}
-	rows = append(rows, []tgb.InlineKeyboardButton{{Text: "Назад к моим группам", CallbackData: "mg|p:0"}})
+    // Кнопки подтверждения оплаты — как и раньше, вверху
+    var confirmRows [][]tgb.InlineKeyboardButton
+    for k, v := range bal {
+        if v > 0 && k.From == uid {
+            confirmRows = append(confirmRows, []tgb.InlineKeyboardButton{
+                {
+                    Text:         fmt.Sprintf("Подтвердить оплату → %s (%s)", a.repo.userName(k.To), formatCents(v)),
+                    CallbackData: fmt.Sprintf("pay|gid:%d|to:%d|amt:%d", gid, k.To, v),
+                },
+            })
+        }
+    }
+    if len(confirmRows) > 0 {
+        rows = append(confirmRows, rows...)
+    }
 
-	for k, v := range bal {
-		if v > 0 && k.From == uid {
-			btn := tgb.InlineKeyboardButton{
-				Text:         fmt.Sprintf("Подтвердить оплату → %s (%s)", a.repo.userName(k.To), formatCents(v)),
-				CallbackData: fmt.Sprintf("pay|gid:%d|to:%d|amt:%d", gid, k.To, v),
-			}
-			rows = append([][]tgb.InlineKeyboardButton{{btn}}, rows...)
-		}
-	}
+    markup := tgb.InlineKeyboardMarkup{InlineKeyboard: rows}
 
-	editOrSend(b, ctx, strings.Join(lines, "\n"), &tgb.InlineKeyboardMarkup{InlineKeyboard: rows})
-	return nil
+    // Редактируем, если пришли из callback; иначе — отправляем
+    if ctx.CallbackQuery != nil && ctx.CallbackQuery.Message != nil {
+        _, _, _ = ctx.CallbackQuery.Message.EditText(b, text, &tgb.EditMessageTextOpts{
+            ParseMode:          tgb.ParseModeHTML,
+            LinkPreviewOptions: &tgb.LinkPreviewOptions{IsDisabled: true},
+            ReplyMarkup:        markup,
+        })
+        return nil
+    }
+    _, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
+        ParseMode:          tgb.ParseModeHTML,
+        LinkPreviewOptions: &tgb.LinkPreviewOptions{IsDisabled: true},
+        ReplyMarkup:        &markup,
+    })
+    return nil
 }
+
 
 func (a *app) sendInviteForGroupEdit(b *tgb.Bot, ctx *ext.Context, gid int64) error {
-	code, err := a.repo.getInviteCode(gid)
-	if err != nil {
-		return err
-	}
+    code, err := a.repo.getInviteCode(gid)
+    if err != nil {
+        return err
+    }
 
-	txt := "/join " + code
-	enc := url.QueryEscape(txt)
-	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)
-	htmlJoin := fmt.Sprintf(`<a href="%s">/join %s</a>`, share, code)	
+    txt := "/join " + code
+    enc := url.QueryEscape(txt)
+    enc = strings.ReplaceAll(enc, "+", "%20")
+    share := fmt.Sprintf("https://t.me/share/url?url=%s", enc)
 
-	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: %s", gid, htmlJoin)
-	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
-		{{Text: "Поделиться /join…", Url: share}},
-	}})
-	return nil
+    // Ровно как при создании группы: кликабельный HTML + без превью
+    htmlJoin := fmt.Sprintf(`<a href="%s">/join %s</a>`, share, code)
+    text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: %s", gid, htmlJoin)
+
+    // Так как вызывается из callback — редактируем исходное сообщение
+    if ctx.CallbackQuery != nil && ctx.CallbackQuery.Message != nil {
+        _, _, _ = ctx.CallbackQuery.Message.EditText(b, text, &tgb.EditMessageTextOpts{
+            ParseMode:          tgb.ParseModeHTML,
+            LinkPreviewOptions: &tgb.LinkPreviewOptions{IsDisabled: true},
+            ReplyMarkup: tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
+                {{Text: "Поделиться /join…", Url: share}},
+            }},
+        })
+        return nil
+    }
+
+    // На всякий случай — если это будет отправка, а не редактирование
+    _, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
+        ParseMode:          tgb.ParseModeHTML,
+        LinkPreviewOptions: &tgb.LinkPreviewOptions{IsDisabled: true},
+        ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
+            {{Text: "Поделиться /join…", Url: share}},
+        }},
+    })
+    return nil
 }
+
 
 func (a *app) sendExpensesPageEdit(b *tgb.Bot, ctx *ext.Context, gid int64, page int) error {
 	total, err := a.repo.countGroupExpenses(gid)
