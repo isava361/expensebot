@@ -937,16 +937,16 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 		if err != nil {
 			return err
 		}
-		link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
 
 		// гиперссылка на /join <код> для пересылки в другой чат
 		shareText := url.QueryEscape("/join " + code)
 		shareText = strings.ReplaceAll(shareText, "+", "%20")
-		shareHref := fmt.Sprintf("tg://msg?text=%s", shareText)
+		shareHref := fmt.Sprintf("https://t.me/share/url?text=%s", shareText) 
 		htmlJoin := fmt.Sprintf(`<a href="%s">/join %s</a>`, shareHref, code)
 
-		text := fmt.Sprintf("Группа #%d создана: %s\nПриглашение: %s\nКоманда: %s",
-			gid, title, link, htmlJoin)
+
+		text := fmt.Sprintf("Группа #%d создана: %s\nКоманда: %s",
+			gid, title, htmlJoin)
 
 		// ВАЖНО: вместо устаревшего DisableWebPagePreview используем LinkPreviewOptions
 		_, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
@@ -1331,7 +1331,6 @@ func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) erro
 	if err != nil {
 		return err
 	}
-	link := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
 
 	bal, err := a.repo.computeGroupBalances(gid)
 	if err != nil {
@@ -1355,7 +1354,7 @@ func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) erro
 
 	var lines []string
 	lines = append(lines, fmt.Sprintf("Группа #%d", gid))
-	lines = append(lines, fmt.Sprintf("Приглашение: %s\nКоманда: /join %s", link, code))
+	lines = append(lines, fmt.Sprintf("Команда: /join %s", code))
 	if len(youOwe) == 0 && len(oweYou) == 0 {
 		lines = append(lines, "В этой группе долгов нет 🎉")
 	} else {
@@ -1373,7 +1372,7 @@ func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) erro
 	txt := "/join " + code
 	enc := url.QueryEscape(txt)
 	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("tg://msg?text=%s", enc)
+	share := fmt.Sprintf("https://t.me/share/url?text=%s", enc) 	
 
 	rows := [][]tgb.InlineKeyboardButton{
 		{{Text: "Поделиться /join…", Url: share}},
@@ -1405,14 +1404,13 @@ func (a *app) sendInviteForGroupEdit(b *tgb.Bot, ctx *ext.Context, gid int64) er
 	if err != nil {
 		return err
 	}
-	urlStart := fmt.Sprintf("https://t.me/%s?start=%s", a.base, code)
 
 	txt := "/join " + code
 	enc := url.QueryEscape(txt)
 	enc = strings.ReplaceAll(enc, "+", "%20")
-	share := fmt.Sprintf("tg://msg?text=%s", enc)
+	share := fmt.Sprintf("https://t.me/share/url?text=%s", enc)	
 
-	text := fmt.Sprintf("Приглашение в группу #%d:\n%s\nКоманда: /join %s", gid, urlStart, code)
+	text := fmt.Sprintf("Приглашение в группу #%d:\nКоманда: /join %s", gid, code)
 	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
 		{{Text: "Поделиться /join…", Url: share}},
 	}})
