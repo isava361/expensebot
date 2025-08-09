@@ -676,25 +676,43 @@ func mainKeyboard() *tgb.ReplyKeyboardMarkup {
 // ---------- Handlers ----------
 
 func (a *app) onStart(b *tgb.Bot, ctx *ext.Context) error {
-	uid := ctx.EffectiveUser.Id
-	name := getBestName(ctx)
-	_ = a.repo.upsertUser(uid, name)
+    uid := ctx.EffectiveUser.Id
+    name := getBestName(ctx)
+    _ = a.repo.upsertUser(uid, name)
 
-	// Deep-link: /start <invite_code>
-	if args := ctx.Args(); len(args) == 1 {
-		code := args[0]
-		if gid, title, err := a.repo.joinByCode(code, uid); err == nil {
-			_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title),
-				&tgb.SendMessageOpts{ReplyMarkup: mainKeyboard()})
-			return nil
-		}
-	}
+    // --- NEW: accept /start@<code> and /start_<code> too ---
+    raw := strings.TrimSpace(ctx.EffectiveMessage.Text)
+    // normalize weird spaces
+    raw = strings.ReplaceAll(raw, "\u00A0", " ")
+    raw = strings.ReplaceAll(raw, "\u2009", " ")
+    raw = strings.ReplaceAll(raw, "\u202F", " ")
 
-	msg := "Привет! Я помогу делить траты в поездках.\n" +
-		"Используйте кнопки ниже."
-	_, _ = ctx.EffectiveChat.SendMessage(b, msg, &tgb.SendMessageOpts{ReplyMarkup: mainKeyboard()})
-	return nil
+    var code string
+    if args := ctx.Args(); len(args) == 1 {
+        code = args[0]
+    } else if strings.HasPrefix(raw, "/start@") {
+        code = strings.TrimSpace(strings.TrimPrefix(raw, "/start@"))
+    } else if strings.HasPrefix(raw, "/start_") {
+        code = strings.TrimSpace(strings.TrimPrefix(raw, "/start_"))
+    }
+    if code != "" {
+        if gid, title, err := a.repo.joinByCode(code, uid); err == nil {
+            _, _ = ctx.EffectiveChat.SendMessage(
+                b,
+                fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title),
+                &tgb.SendMessageOpts{ReplyMarkup: mainKeyboard()},
+            )
+            return nil
+        }
+        // fall through to greeting if code invalid
+    }
+    // --------------------------------------------------------
+
+    msg := "Привет! Я помогу делить траты в поездках.\nИспользуйте кнопки ниже."
+    _, _ = ctx.EffectiveChat.SendMessage(b, msg, &tgb.SendMessageOpts{ReplyMarkup: mainKeyboard()})
+    return nil
 }
+
 
 func (a *app) onCancel(b *tgb.Bot, ctx *ext.Context) error {
 	uid := ctx.EffectiveUser.Id
@@ -798,6 +816,33 @@ func editOrSend(b *tgb.Bot, ctx *ext.Context, text string, markup *tgb.InlineKey
 func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 	txt := strings.TrimSpace(ctx.EffectiveMessage.Text)
 
+	uid := ctx.EffectiveUser.Id
+
+	if a.state.IsNewGroup(uid) || func() bool { _, ok := a.state.Get(uid); return ok }() {
+		// If the user hits any top-level button during a wizard – don’t start it.
+		top := map[string]bool{
+			"➕ Создать группу": true, "👥 Мои группы": true, "🔗 Приглашение": true,
+			"🧾 Добавить трату": true, "📊 Балансы": true, "🔄 Взаимозачёт": true,
+		}
+		if top[txt] {
+			_, _ = ctx.EffectiveChat.SendMessage(b, "Сейчас идёт мастер. Отправьте запрошенные данные или нажмите /cancel (или «❌ Отмена»).", nil)
+			return nil
+		}
+	}
+
+	// quick accept: /start@<code> or /start_<code>
+	if strings.HasPrefix(txt, "/start@") || strings.HasPrefix(txt, "/start_") {
+		code := strings.TrimPrefix(strings.TrimPrefix(txt, "/start@"), "/start_")
+		code = strings.TrimSpace(code)
+		if gid, title, err := a.repo.joinByCode(code, ctx.EffectiveUser.Id); err == nil {
+			_, _ = ctx.EffectiveChat.SendMessage(b,
+				fmt.Sprintf("Вы присоединились к группе #%d: %s", gid, title),
+				&tgb.SendMessageOpts{ReplyMarkup: mainKeyboard()},
+			)
+			return nil
+		}
+	}
+
 	// быстрый парсер команд вида /join_<code>
 	if strings.HasPrefix(txt, "/join_") {
 		fields := strings.Fields(strings.TrimPrefix(txt, "/join_"))
@@ -810,8 +855,6 @@ func (a *app) onText(b *tgb.Bot, ctx *ext.Context) error {
 			}
 		}
 	}
-
-	uid := ctx.EffectiveUser.Id
 
 	// если ждём название новой группы
 	if a.state.IsNewGroup(uid) {
@@ -893,12 +936,12 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 	case "await_amount_desc":
 		parts := strings.Fields(txt)
 		if len(parts) == 0 {
-			_, _ = ctx.EffectiveChat.SendMessage(b, "Нужно прислать сумму и описание. Пример: 1200 обед", nil)
+			_, _ = ctx.EffectiveChat.SendMessage(b, "Нужно прислать сумму и описание. Пример: 1200 обед", inlineCancel())
 			return nil
 		}
 		amt, err := centsFromStr(parts[0])
 		if err != nil || amt <= 0 {
-			_, _ = ctx.EffectiveChat.SendMessage(b, "Сумма не распознана. Пример: 1200 обед", nil)
+			_, _ = ctx.EffectiveChat.SendMessage(b, "Сумма не распознана. Пример: 1200 обед", inlineCancel())
 			return nil
 		}
 		st.AmountCents = amt
@@ -923,7 +966,7 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 
 		amt, err := centsFromStr(strings.TrimSpace(txt))
 		if err != nil || amt < 0 {
-			editOrSend(b, ctx, "Сумма не распознана. Пришлите число, напр. 350.50", nil)
+			editOrSend(b, ctx, "Сумма не распознана. Пришлите число, напр. 350.50", inlineCancel())
 			return nil
 		}
 
@@ -934,7 +977,8 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 		if amt > remaining {
 			editOrSend(b, ctx,
 				fmt.Sprintf("Слишком много. Остаток — %s. Введите сумму для %s не больше остатка.",
-					formatCents(remaining), name), nil)
+					formatCents(remaining), name), inlineCancel()
+				)
 			return nil
 		}
 		// Для последнего участника — автодобивание остатка.
@@ -954,12 +998,14 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 		progress := "Назначено:\n• " + strings.Join(parts, "\n• ")
 
 		if len(st.CustomLeft) == 0 {
-			editOrSend(b, ctx, progress+"\nВсе суммы заданы. Сохраняю…", nil)
+			editOrSend(b, ctx, progress+"\nВсе суммы заданы. Сохраняю…", inlineCancel()
+		)
 			return a.finalizeExpense(b, ctx, st)
 		}
 		next := st.CustomLeft[0]
 		editOrSend(b, ctx, fmt.Sprintf("%s\n\nВведите сумму для участника %s (остаток — %s):",
-			progress, a.repo.userName(next), formatCents(st.AmountCents-sumMap(st.CustomShares))), nil)
+			progress, a.repo.userName(next), formatCents(st.AmountCents-sumMap(st.CustomShares))), inlineCancel()
+		)
 		return nil
 	}
 
@@ -988,7 +1034,9 @@ func (a *app) askNextCustom(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) e
 	}
 	editOrSend(b, ctx,
 		fmt.Sprintf("%sВведите сумму для участника %s (остаток — %s, максимум — %s):",
-			progress, name, formatCents(remaining), formatCents(remaining)), nil)
+			progress, name, formatCents(remaining), formatCents(remaining)),
+		inlineCancel()
+	)
 	return nil
 }
 
@@ -999,6 +1047,13 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 	uid := ctx.EffectiveUser.Id
 
 	switch {
+		
+	case data == "cancel_flow":
+        a.state.Del(uid)            // drop add-expense state if any
+        a.state.SetNewGroup(uid, false)
+        editOrSend(b, ctx, "Отменено. Что дальше?", nil)
+        _, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Отменено"})
+        return nil
 	// paging: groups
 	case strings.HasPrefix(data, "mg|p:"):
 		page := mustAtoi(strings.TrimPrefix(data, "mg|p:"))
@@ -1344,6 +1399,7 @@ func (a *app) askPayer(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error 
 			{Text: fmt.Sprintf("Плательщик: %s", m.Name), CallbackData: fmt.Sprintf("payer|%d", m.ID)},
 		})
 	}
+	btns = append(btns, []tgb.InlineKeyboardButton{{Text: "❌ Отмена", CallbackData: "cancel_flow"}})
 	text := fmt.Sprintf("Сумма: %s\nОписание: %s\nВыберите плательщика:", formatCents(st.AmountCents), st.Description)
 	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: btns})
 	return nil
@@ -1361,13 +1417,14 @@ func (a *app) askParticipants(b *tgb.Bot, ctx *ext.Context, st *addExpenseState)
 		if on {
 			label = "✅ " + label
 		} else {
-			label = "☑️ " + label
+			label = "❌ " + label   // was "☑️ "
 		}
 		rows = append(rows, []tgb.InlineKeyboardButton{
 			{Text: label, CallbackData: fmt.Sprintf("toggle|%d", m.ID)},
 		})
-	}
+	}	
 	rows = append(rows, []tgb.InlineKeyboardButton{{Text: "Готово →", CallbackData: "part_done"}})
+	rows = append(rows, []tgb.InlineKeyboardButton{{Text: "❌ Отмена", CallbackData: "cancel_flow"}})
 	editOrSend(b, ctx, "Выберите участников (нажимайте, чтобы включить/исключить), затем «Готово».",
 		&tgb.InlineKeyboardMarkup{InlineKeyboard: rows})
 	return nil
@@ -1522,4 +1579,10 @@ func (a *app) onJoin(b *tgb.Bot, ctx *ext.Context) error {
 	} else {
 		return err
 	}
+}
+
+func inlineCancel() *tgb.InlineKeyboardMarkup {
+    return &tgb.InlineKeyboardMarkup{InlineKeyboard: [][]tgb.InlineKeyboardButton{
+        {{Text: "❌ Отмена", CallbackData: "cancel_flow"}},
+    }}
 }
