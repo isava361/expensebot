@@ -8,7 +8,7 @@ package main
 // - В деталях группы: "Вы должны" и "Вам должны".
 // - Кнопка "Взаимозачёт" (по всем группам).
 // - Исправлено: нельзя создать группу без названия; удаление групп; удаление трат.
-// - Пагинации сохраняются, но работают через edit.
+// - Пагинации через edit.
 //
 // ENV:
 //   BOT_TOKEN=<telegram bot token>
@@ -186,7 +186,7 @@ type stateStore struct {
 	mu            sync.RWMutex
 	addEx         map[int64]*addExpenseState // user tg id -> state
 	newGroupAsk   map[int64]bool             // ждём название группы
-	lastMsgByUser map[int64]int              // message_id последнего «редактируемого» сообщения
+	lastMsgByUser map[int64]int              // (пока не используем)
 }
 
 func newStateStore() *stateStore {
@@ -717,14 +717,14 @@ func editOrSend(b *tgb.Bot, ctx *ext.Context, text string, markup *tgb.InlineKey
 	if ctx.CallbackQuery != nil && ctx.CallbackQuery.Message != nil {
 		if markup != nil {
 			_, _, _ = ctx.CallbackQuery.Message.EditText(b, text, &tgb.EditMessageTextOpts{
-				ReplyMarkup: *markup, // разыменовали: значение, не указатель
+				ReplyMarkup: *markup, // значение (не указатель)
 			})
 		} else {
 			_, _, _ = ctx.CallbackQuery.Message.EditText(b, text, nil)
 		}
 	} else {
 		_, _ = ctx.EffectiveChat.SendMessage(b, text, &tgb.SendMessageOpts{
-			ReplyMarkup: markup, // ok: интерфейс ReplyMarkup принимает *InlineKeyboardMarkup
+			ReplyMarkup: markup,
 		})
 	}
 }
@@ -849,7 +849,7 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 		nextUID := st.CustomLeft[0]
 		amt, err := centsFromStr(txt)
 		if err != nil || amt < 0 {
-			_, _ = ctx.EffectiveChat.SendMessage(b, "Сумма не распознана. Пришлите число, напр. 350.50", nil)
+			editOrSend(b, ctx, "Сумма не распознана. Пришлите число, напр. 350.50", nil)
 			return nil
 		}
 		st.CustomShares[nextUID] = amt
@@ -861,7 +861,7 @@ func (a *app) onTextFlowAddExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseS
 				sum += v
 			}
 			if sum != st.AmountCents {
-				_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Сумма долей %s ≠ общей суммы %s. Пришлите /cancel и начните заново или исправьте последнюю сумму.", formatCents(sum), formatCents(st.AmountCents)), nil)
+				editOrSend(b, ctx, fmt.Sprintf("Сумма долей %s ≠ общей суммы %s. Пришлите /cancel и начните заново или исправьте последнюю сумму.", formatCents(sum), formatCents(st.AmountCents)), nil)
 				return nil
 			}
 			return a.finalizeExpense(b, ctx, st)
@@ -923,7 +923,7 @@ func (a *app) cb(b *tgb.Bot, ctx *ext.Context) error {
 			CustomShares: map[int64]int64{},
 			Step:         "await_amount_desc",
 		})
-		// оставим как отдельное сообщение-подсказку
+		// Первое сообщение отдельно (после текста пользователя)
 		_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Группа #%d выбрана. Пришлите сумму и описание одним сообщением, напр.:\n1500 такси из аэропорта", gid), nil)
 		_, _ = ctx.CallbackQuery.Answer(b, &tgb.AnswerCallbackQueryOpts{Text: "Группа выбрана"})
 		return nil
@@ -1122,7 +1122,7 @@ func (a *app) sendGroupDetailsEdit(b *tgb.Bot, ctx *ext.Context, gid int64) erro
 	}
 	rows = append(rows, []tgb.InlineKeyboardButton{{Text: "Назад к моим группам", CallbackData: "mg|p:0"}})
 
-	// персонифицированные confirm для «вы должны»
+	// персональные confirm для «вы должны»
 	for k, v := range bal {
 		if v > 0 && k.From == uid {
 			btn := tgb.InlineKeyboardButton{
@@ -1199,12 +1199,12 @@ func (a *app) sendExpensesPageEdit(b *tgb.Bot, ctx *ext.Context, gid int64, page
 	return nil
 }
 
-// ---------- Add expense sub-steps ----------
+// ---------- Add expense sub-steps (EDIT вместо новых) ----------
 
 func (a *app) askPayer(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error {
 	members, err := a.repo.listMembers(st.GroupID)
 	if err != nil || len(members) == 0 {
-		_, _ = ctx.EffectiveChat.SendMessage(b, "В группе пока нет участников.", nil)
+		editOrSend(b, ctx, "В группе пока нет участников.", nil)
 		return nil
 	}
 	var btns [][]tgb.InlineKeyboardButton
@@ -1213,8 +1213,8 @@ func (a *app) askPayer(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error 
 			{Text: fmt.Sprintf("Плательщик: %s", m.Name), CallbackData: fmt.Sprintf("payer|%d", m.ID)},
 		})
 	}
-	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Сумма: %s\nОписание: %s\nВыберите плательщика:", formatCents(st.AmountCents), st.Description),
-		&tgb.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: btns}})
+	text := fmt.Sprintf("Сумма: %s\nОписание: %s\nВыберите плательщика:", formatCents(st.AmountCents), st.Description)
+	editOrSend(b, ctx, text, &tgb.InlineKeyboardMarkup{InlineKeyboard: btns})
 	return nil
 }
 
@@ -1237,8 +1237,8 @@ func (a *app) askParticipants(b *tgb.Bot, ctx *ext.Context, st *addExpenseState)
 		})
 	}
 	rows = append(rows, []tgb.InlineKeyboardButton{{Text: "Готово →", CallbackData: "part_done"}})
-	_, _ = ctx.EffectiveChat.SendMessage(b, "Выберите участников (нажимайте, чтобы включить/исключить), затем «Готово».",
-		&tgb.SendMessageOpts{ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: rows}})
+	editOrSend(b, ctx, "Выберите участников (нажимайте, чтобы включить/исключить), затем «Готово».",
+		&tgb.InlineKeyboardMarkup{InlineKeyboard: rows})
 	return nil
 }
 
@@ -1247,9 +1247,7 @@ func (a *app) askSplitMode(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) er
 		{{Text: "Поровну", CallbackData: "split|equal"}},
 		{{Text: "Свои доли", CallbackData: "split|custom"}},
 	}
-	_, _ = ctx.EffectiveChat.SendMessage(b, "Как разделить?", &tgb.SendMessageOpts{
-		ReplyMarkup: &tgb.InlineKeyboardMarkup{InlineKeyboard: btns},
-	})
+	editOrSend(b, ctx, "Как разделить?", &tgb.InlineKeyboardMarkup{InlineKeyboard: btns})
 	return nil
 }
 
@@ -1259,7 +1257,7 @@ func (a *app) askNextCustom(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) e
 	}
 	uid := st.CustomLeft[0]
 	name := a.repo.userName(uid)
-	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Введите сумму для участника %s (остаток — %s):",
+	editOrSend(b, ctx, fmt.Sprintf("Введите сумму для участника %s (остаток — %s):",
 		name, formatCents(st.AmountCents-sumMap(st.CustomShares))), nil)
 	return nil
 }
@@ -1275,7 +1273,7 @@ func sumMap(m map[int64]int64) int64 {
 func (a *app) finalizeExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseState) error {
 	if st.SplitMode == "custom" {
 		if sumMap(st.CustomShares) != st.AmountCents {
-			_, _ = ctx.EffectiveChat.SendMessage(b, "Сумма долей не равна общей сумме. Отмените /cancel и начните заново.", nil)
+			editOrSend(b, ctx, "Сумма долей не равна общей сумме. Отмените /cancel и начните заново.", nil)
 			return nil
 		}
 	}
@@ -1284,7 +1282,7 @@ func (a *app) finalizeExpense(b *tgb.Bot, ctx *ext.Context, st *addExpenseState)
 		return err
 	}
 	a.state.Del(ctx.EffectiveUser.Id)
-	_, _ = ctx.EffectiveChat.SendMessage(b, fmt.Sprintf("Трата #%d добавлена. Сумма %s, плательщик %s.", id, formatCents(st.AmountCents), a.repo.userName(st.Payer)), nil)
+	editOrSend(b, ctx, fmt.Sprintf("Трата #%d добавлена. Сумма %s, плательщик %s.", id, formatCents(st.AmountCents), a.repo.userName(st.Payer)), nil)
 	return nil
 }
 
