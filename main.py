@@ -18,6 +18,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
@@ -48,6 +49,9 @@ logger = logging.getLogger(__name__)
 GROUPS_PER_PAGE = 5
 EXPENSES_PER_PAGE = 10
 MEMBERS_PER_PAGE = 15
+SETTLEMENTS_PER_PAGE = 10
+MAX_AMOUNT_CENTS = 1_000_000_000
+MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 
 # ---------- Utils ----------
 
@@ -101,7 +105,10 @@ def cents_from_str(s: str) -> int:
             raise ValueError("invalid amount")
         value = int(s) * 100
 
-    return -value if negative else value
+    value = -value if negative else value
+    if abs(value) > MAX_AMOUNT_CENTS:
+        raise ValueError("amount too large")
+    return value
 
 
 def split_amount_and_description(text: str) -> tuple[str, str]:
@@ -129,6 +136,10 @@ def format_cents(c: int) -> str:
         sign = "-"
         c = -c
     return f"{sign}{c // 100}.{c % 100:02d}"
+
+
+def format_time(ts: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 def rand_code() -> str:
@@ -161,63 +172,6 @@ def extract_bare_code(raw: str) -> str:
     return s if _CODE_RE.fullmatch(s) else ""
 
 
-# ---------- DB schema ----------
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
-CREATE TABLE IF NOT EXISTS users(
-    tg_id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS "groups"(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    owner_tg_id INTEGER NOT NULL,
-    invite_code TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS group_members(
-    group_id INTEGER NOT NULL,
-    tg_id INTEGER NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member',
-    PRIMARY KEY(group_id, tg_id),
-    FOREIGN KEY(group_id) REFERENCES "groups"(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS expenses(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER NOT NULL,
-    payer_tg_id INTEGER NOT NULL,
-    description TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    deleted INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY(group_id) REFERENCES "groups"(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS expense_participants(
-    expense_id INTEGER NOT NULL,
-    participant_tg_id INTEGER NOT NULL,
-    share_cents INTEGER NOT NULL,
-    PRIMARY KEY(expense_id, participant_tg_id),
-    FOREIGN KEY(expense_id) REFERENCES expenses(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS settlements(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER,
-    from_tg_id INTEGER NOT NULL,
-    to_tg_id INTEGER NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    confirmed_by_to INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
-);
-"""
-
 # ---------- Repo ----------
 
 class Repo:
@@ -225,7 +179,61 @@ class Repo:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        if not MIGRATIONS_DIR.exists():
+            raise RuntimeError(f"migrations directory not found: {MIGRATIONS_DIR}")
+
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations("
+                "version TEXT PRIMARY KEY,"
+                "applied_at INTEGER NOT NULL"
+                ")"
+            )
+            applied = {
+                row["version"]
+                for row in self._conn.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
+            for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                version = path.stem
+                if version in applied:
+                    continue
+                if version == "002_expense_created_by":
+                    self._migrate_expense_created_by()
+                    self._conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                        (version, now_unix()),
+                    )
+                    continue
+                sql = path.read_text(encoding="utf-8")
+                self._conn.executescript(sql)
+                self._conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)",
+                    (version, now_unix()),
+                )
+            self._conn.commit()
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row["name"] == column for row in rows)
+
+    def _migrate_expense_created_by(self) -> None:
+        if not self._column_exists("expenses", "created_by_tg_id"):
+            self._conn.execute("ALTER TABLE expenses ADD COLUMN created_by_tg_id INTEGER")
+        self._conn.execute(
+            "UPDATE expenses SET created_by_tg_id=payer_tg_id "
+            "WHERE created_by_tg_id IS NULL"
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
     # -- users --
 
@@ -297,6 +305,15 @@ class Repo:
             ).fetchone()
         return row is not None
 
+    def can_view_group(self, group_id: int, uid: int) -> bool:
+        return self.is_group_member(group_id, uid)
+
+    def can_add_expense(self, group_id: int, uid: int) -> bool:
+        return self.is_group_member(group_id, uid)
+
+    def can_view_settlements(self, group_id: int, uid: int) -> bool:
+        return self.is_group_member(group_id, uid)
+
     def get_invite_code(self, group_id: int) -> str:
         with self._lock:
             row = self._conn.execute(
@@ -319,6 +336,9 @@ class Repo:
                 'SELECT owner_tg_id FROM "groups" WHERE id=?', (group_id,)
             ).fetchone()
         return row is not None and row["owner_tg_id"] == uid
+
+    def can_delete_group(self, group_id: int, uid: int) -> bool:
+        return self.is_group_owner(group_id, uid)
 
     def delete_group(self, group_id: int) -> None:
         with self._lock:
@@ -355,6 +375,7 @@ class Repo:
     def create_expense(
         self,
         group_id: int,
+        created_by: int,
         payer: int,
         description: str,
         amount_cents: int,
@@ -368,15 +389,18 @@ class Repo:
                 (group_id,),
             ).fetchall()
             members = {r["tg_id"] for r in rows}
+            if created_by not in members:
+                raise ValueError("creator is not a group member")
             if payer not in members:
                 raise ValueError("payer is not a group member")
             if not set(shares).issubset(members):
                 raise ValueError("expense participant is not a group member")
 
             cur = self._conn.execute(
-                "INSERT INTO expenses(group_id,payer_tg_id,description,amount_cents,created_at)"
-                " VALUES(?,?,?,?,?)",
-                (group_id, payer, description, amount_cents, now_unix()),
+                "INSERT INTO expenses("
+                "group_id,created_by_tg_id,payer_tg_id,description,amount_cents,created_at"
+                ") VALUES(?,?,?,?,?,?)",
+                (group_id, created_by, payer, description, amount_cents, now_unix()),
             )
             expense_id = cur.lastrowid
             self._conn.executemany(
@@ -397,9 +421,8 @@ class Repo:
     def can_delete_expense(self, expense_id: int, group_id: int, uid: int) -> bool:
         with self._lock:
             row = self._conn.execute(
-                "SELECT e.payer_tg_id, g.owner_tg_id"
+                "SELECT e.created_by_tg_id"
                 " FROM expenses e"
-                ' JOIN "groups" g ON g.id=e.group_id'
                 " WHERE e.id=? AND e.group_id=? AND e.deleted=0",
                 (expense_id, group_id),
             ).fetchone()
@@ -407,7 +430,7 @@ class Repo:
             return False
         if not self.is_group_member(group_id, uid):
             return False
-        return uid in (row["payer_tg_id"], row["owner_tg_id"])
+        return row["created_by_tg_id"] == uid
 
     def get_expense_shares(self, expense_id: int) -> dict:
         with self._lock:
@@ -421,7 +444,7 @@ class Repo:
     def list_group_expenses(self, group_id: int, limit: int, offset: int) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id,payer_tg_id,amount_cents,description,created_at"
+                "SELECT id,payer_tg_id,created_by_tg_id,amount_cents,description,created_at"
                 " FROM expenses WHERE group_id=? AND deleted=0"
                 " ORDER BY id DESC LIMIT ? OFFSET ?",
                 (group_id, limit, offset),
@@ -430,6 +453,7 @@ class Repo:
             {
                 "id": r["id"],
                 "payer": r["payer_tg_id"],
+                "created_by": r["created_by_tg_id"],
                 "amount_cents": r["amount_cents"],
                 "desc": r["description"],
                 "created_at": r["created_at"],
@@ -546,18 +570,6 @@ class Repo:
 
     # -- settlements --
 
-    def add_settlement(
-        self, group_id: int, from_uid: int, to_uid: int, amount_cents: int
-    ) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO settlements"
-                "(group_id,from_tg_id,to_tg_id,amount_cents,confirmed_by_to,created_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (group_id, from_uid, to_uid, amount_cents, 1, now_unix()),
-            )
-            self._conn.commit()
-
     def add_settlement_if_current(
         self, group_id: int, from_uid: int, to_uid: int, amount_cents: int
     ) -> bool:
@@ -581,6 +593,51 @@ class Repo:
             )
             self._conn.commit()
             return True
+
+    def count_group_settlements(self, group_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM settlements WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+        return row[0] if row else 0
+
+    def list_group_settlements(self, group_id: int, limit: int, offset: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, from_tg_id, to_tg_id, amount_cents, created_at"
+                " FROM settlements WHERE group_id=?"
+                " ORDER BY id DESC LIMIT ? OFFSET ?",
+                (group_id, limit, offset),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "from": r["from_tg_id"],
+                "to": r["to_tg_id"],
+                "amount_cents": r["amount_cents"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def can_delete_settlement(self, settlement_id: int, group_id: int, uid: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT from_tg_id FROM settlements WHERE id=? AND group_id=?",
+                (settlement_id, group_id),
+            ).fetchone()
+        if row is None:
+            return False
+        return row["from_tg_id"] == uid or self.is_group_owner(group_id, uid)
+
+    def delete_settlement(self, settlement_id: int, group_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM settlements WHERE id=? AND group_id=?",
+                (settlement_id, group_id),
+            )
+            self._conn.commit()
 
 
 # ---------- Keyboards ----------
@@ -1134,7 +1191,7 @@ class App:
                     await self._send_expenses_page(update, ctx, gid, page)
                     return
                 except Exception:
-                    pass
+                    logger.exception("failed to delete expense")
             await query.answer("Ошибка удаления")
             return
 
@@ -1165,7 +1222,7 @@ class App:
                             f" в группе #{gid} ({title}).",
                         )
                     except Exception:
-                        pass
+                        logger.info("failed to notify payment receiver %s", to)
                     try:
                         await ctx.bot.send_message(
                             uid,
@@ -1174,19 +1231,19 @@ class App:
                             f" ({title}) зафиксирована.",
                         )
                     except Exception:
-                        pass
+                        logger.info("failed to notify payment sender %s", uid)
                     await query.answer("Оплата подтверждена")
                     await self._send_group_details(update, ctx, gid)
                     return
                 except Exception:
-                    pass
+                    logger.exception("failed to confirm payment")
             await query.answer("Ошибка подтверждения")
             return
 
         # Delete group (owner only)
         if data.startswith("grpdel|"):
             gid = int(data[len("grpdel|gid:"):])
-            if not self.repo.is_group_owner(gid, uid):
+            if not self.repo.can_delete_group(gid, uid):
                 await query.answer("Только владелец может удалить группу")
                 return
             markup = InlineKeyboardMarkup([
@@ -1203,7 +1260,7 @@ class App:
 
         if data.startswith("grpdelyes|"):
             gid = int(data[len("grpdelyes|gid:"):])
-            if not self.repo.is_group_owner(gid, uid):
+            if not self.repo.can_delete_group(gid, uid):
                 await query.answer("Только владелец может удалить группу", show_alert=True)
                 return
             try:
@@ -1213,7 +1270,7 @@ class App:
                 await self._edit_or_send(update, "Группа удалена. Ваши группы:", markup)
                 return
             except Exception:
-                pass
+                logger.exception("failed to delete group")
             await query.answer("Ошибка удаления группы")
             return
 
@@ -1229,6 +1286,43 @@ class App:
                     await query.answer("Нет доступа", show_alert=True)
                     return
             await query.answer()
+            return
+
+        # Settlement history
+        if data.startswith("setlist|"):
+            parts = data.split("|")
+            if len(parts) >= 3 and parts[2].startswith("p:"):
+                gid = int(parts[1])
+                page = int(parts[2][2:])
+                if self.repo.can_view_settlements(gid, uid):
+                    await self._send_settlements_page(update, gid, page)
+                else:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
+            await query.answer()
+            return
+
+        if data.startswith("setdel|"):
+            parts = data.split("|")
+            if (
+                len(parts) >= 4
+                and parts[2].startswith("gid:")
+                and parts[3].startswith("p:")
+            ):
+                settlement_id = int(parts[1])
+                gid = int(parts[2][4:])
+                page = int(parts[3][2:])
+                try:
+                    if not self.repo.can_delete_settlement(settlement_id, gid, uid):
+                        await query.answer("Нет прав на отмену", show_alert=True)
+                        return
+                    self.repo.delete_settlement(settlement_id, gid)
+                    await query.answer("Платеж отменен")
+                    await self._send_settlements_page(update, gid, page)
+                    return
+                except Exception:
+                    logger.exception("failed to delete settlement")
+            await query.answer("Ошибка отмены платежа")
             return
 
         # Add-expense flow callbacks
@@ -1262,6 +1356,33 @@ class App:
             st["participants"][pid] = not st["participants"].get(pid, False)
             _set_ae(ctx, st)
             await query.answer()
+            await self._ask_participants(update, ctx, st)
+            return
+
+        if data == "part_all":
+            members = self.repo.list_members(group_id)
+            st["participants"] = {m["id"]: True for m in members}
+            _set_ae(ctx, st)
+            await query.answer("Выбраны все")
+            await self._ask_participants(update, ctx, st)
+            return
+
+        if data == "part_me_payer":
+            participants = {}
+            if self.repo.is_group_member(group_id, uid):
+                participants[uid] = True
+            if self.repo.is_group_member(group_id, st["payer"]):
+                participants[st["payer"]] = True
+            st["participants"] = participants
+            _set_ae(ctx, st)
+            await query.answer("Выбраны вы и плательщик")
+            await self._ask_participants(update, ctx, st)
+            return
+
+        if data == "part_clear":
+            st["participants"] = {}
+            _set_ae(ctx, st)
+            await query.answer("Выбор очищен")
             await self._ask_participants(update, ctx, st)
             return
 
@@ -1304,6 +1425,7 @@ class App:
         try:
             code = self.repo.get_invite_code(gid)
         except Exception:
+            logger.exception("failed to load group details for group %s", gid)
             return
 
         bal = self.repo.compute_group_balances(gid)
@@ -1342,6 +1464,7 @@ class App:
             [InlineKeyboardButton("Поделиться /join…", url=share)],
             [InlineKeyboardButton("👥 Участники", callback_data=f"members|{gid}|p:0")],
             [InlineKeyboardButton("Список трат", callback_data=f"explist|{gid}|p:0")],
+            [InlineKeyboardButton("Платежи", callback_data=f"setlist|{gid}|p:0")],
         ]
         if self.repo.is_group_owner(gid, uid):
             rows.append([InlineKeyboardButton(
@@ -1376,6 +1499,7 @@ class App:
         try:
             code = self.repo.get_invite_code(gid)
         except Exception:
+            logger.exception("failed to load invite for group %s", gid)
             return
 
         cmd = f"/join {code}"
@@ -1426,15 +1550,17 @@ class App:
         for it in items:
             lines.append(
                 f"• #{it['id']} {it['desc']} — {format_cents(it['amount_cents'])}"
-                f" (плательщик: {self.repo.user_name(it['payer'])})\n"
+                f" (плательщик: {self.repo.user_name(it['payer'])},"
+                f" создал: {self.repo.user_name(it['created_by'])})\n"
             )
 
         rows = []
         for it in items:
-            rows.append([InlineKeyboardButton(
-                f"Удалить #{it['id']}",
-                callback_data=f"expdel|{it['id']}|gid:{gid}|p:{page}",
-            )])
+            if self.repo.can_delete_expense(it["id"], gid, update.effective_user.id):
+                rows.append([InlineKeyboardButton(
+                    f"Удалить #{it['id']}",
+                    callback_data=f"expdel|{it['id']}|gid:{gid}|p:{page}",
+                )])
         nav = [InlineKeyboardButton("Назад к группе", callback_data=f"mgsel|{gid}")]
         if page > 0:
             nav.insert(0, InlineKeyboardButton(
@@ -1487,6 +1613,56 @@ class App:
 
         await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup([nav]))
 
+    async def _send_settlements_page(
+        self, update: Update, gid: int, page: int
+    ) -> None:
+        uid = update.effective_user.id
+        total = self.repo.count_group_settlements(gid)
+        offset = page * SETTLEMENTS_PER_PAGE
+        if total > 0 and offset >= total:
+            page = 0
+            offset = 0
+
+        items = self.repo.list_group_settlements(gid, SETTLEMENTS_PER_PAGE, offset)
+        if total == 0:
+            await self._edit_or_send(
+                update,
+                "В группе пока нет платежей.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Назад к группе", callback_data=f"mgsel|{gid}")
+                ]]),
+            )
+            return
+
+        lines = [f"Платежи группы #{gid} (страница {page + 1}):\n"]
+        for item in items:
+            lines.append(
+                f"• #{item['id']} {self.repo.user_name(item['from'])} → "
+                f"{self.repo.user_name(item['to'])}: {format_cents(item['amount_cents'])}"
+                f" ({format_time(item['created_at'])})\n"
+            )
+
+        rows = []
+        for item in items:
+            if self.repo.can_delete_settlement(item["id"], gid, uid):
+                rows.append([InlineKeyboardButton(
+                    f"Отменить #{item['id']}",
+                    callback_data=f"setdel|{item['id']}|gid:{gid}|p:{page}",
+                )])
+
+        nav = [InlineKeyboardButton("Назад к группе", callback_data=f"mgsel|{gid}")]
+        if page > 0:
+            nav.insert(0, InlineKeyboardButton(
+                "« Назад", callback_data=f"setlist|{gid}|p:{page - 1}"
+            ))
+        if offset + SETTLEMENTS_PER_PAGE < total:
+            nav.append(InlineKeyboardButton(
+                "Вперёд »", callback_data=f"setlist|{gid}|p:{page + 1}"
+            ))
+        rows.append(nav)
+
+        await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup(rows))
+
     # ---------- Add-expense sub-steps ----------
 
     async def _ask_payer(
@@ -1519,7 +1695,14 @@ class App:
             on = st["participants"].get(m["id"], False)
             label = ("✅ " if on else "❌ ") + m["name"]
             rows.append([InlineKeyboardButton(label, callback_data=f"toggle|{m['id']}")])
-        rows.append([InlineKeyboardButton("Готово →", callback_data="part_done")])
+        rows.append([
+            InlineKeyboardButton("Все", callback_data="part_all"),
+            InlineKeyboardButton("Я и плательщик", callback_data="part_me_payer"),
+        ])
+        rows.append([
+            InlineKeyboardButton("Очистить", callback_data="part_clear"),
+            InlineKeyboardButton("Готово →", callback_data="part_done"),
+        ])
         rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_flow")])
         await self._edit_or_send(
             update,
@@ -1584,12 +1767,14 @@ class App:
         try:
             expense_id = self.repo.create_expense(
                 group_id,
+                uid,
                 st["payer"],
                 st["description"],
                 st["amount_cents"],
                 shares,
             )
         except Exception as e:
+            logger.exception("failed to create expense")
             await self._edit_or_send(update, f"Ошибка создания траты: {e}")
             return
 
@@ -1610,7 +1795,7 @@ class App:
                     f" Плательщик: {self.repo.user_name(st['payer'])}.",
                 )
             except Exception:
-                pass
+                logger.info("failed to notify expense participant %s", pid)
 
         await self._edit_or_send(
             update,
@@ -1714,7 +1899,10 @@ def main() -> None:
     # are consumed first within the same handler group.
     application.add_handler(MessageHandler(filters.TEXT, bot_app.on_text))
 
-    application.run_polling(drop_pending_updates=True)
+    try:
+        application.run_polling(drop_pending_updates=True)
+    finally:
+        repo.close()
 
 
 if __name__ == "__main__":

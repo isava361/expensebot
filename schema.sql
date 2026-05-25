@@ -1,1 +1,2 @@
--- This file is informational; the app auto-creates the schema.
+-- Informational only.
+-- The application applies versioned SQLite migrations from ./migrations.

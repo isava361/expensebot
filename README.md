@@ -1,40 +1,64 @@
-# Telegram Expenses Bot (Go + gotgbot + SQLite)
+# Telegram Expenses Bot
 
-MVP-бот для разделения трат в поездках.
+Python Telegram bot for splitting group expenses with SQLite storage.
 
-## Фичи
-- Группы с инвайт-ссылками (`/newgroup`, `/invite`).
-- Добавление траты мастером с инлайн-кнопками: выбор плательщика, участников, split поровну или кастомный.
-- Балды по группе (`/balances`) и взаимозачёт по всем группам (`/net`).
-- Удаление траты (`/delexpense`).
-- Подтверждение оплаты (`/confirm <from> <to> <amount>`).
-- SQLite (pure Go driver), потокобезопасные состояния.
+## Features
 
-## Быстрый старт
-1. Установите Go 1.22+.
-2. Создайте бота у @BotFather и получите токен.
-3. Склонируйте проект и запустите:
+- Groups with invite links and join codes.
+- Expense wizard with inline buttons: payer, participants, equal/custom split.
+- Fast participant selection: all, me and payer, clear.
+- Group balances and cross-group netting.
+- Idempotent payment confirmation from inline buttons.
+- Payment history with cancellation by payer or group owner.
+- Expense deletion by the user who created the expense.
+- SQLite migrations in `migrations/`.
+
+## Quick Start
+
+1. Install Python 3.11+.
+2. Create a Telegram bot with `@BotFather` and copy the token.
+3. Install dependencies:
+
+   ```bash
+   python -m pip install -r requirements.txt
+   ```
+
+4. Run the bot:
+
    ```bash
    export BOT_TOKEN=123456:ABC...
-   go mod tidy
-   go run .
+   python main.py
    ```
-4. Команды в боте:
-   - `/start` — приветствие (поддерживает deep-link `?start=<invite_code>`)
-   - `/newgroup <название>` — создать группу
-   - `/mygroups` — список ваших групп
-   - `/invite <group_id>` — ссылка-приглашение
-   - `/addexpense <group_id>` — мастер добавления траты
-   - `/balances <group_id>` — балансы внутри группы
-   - `/net` — взаимозачёт по всем группам
-   - `/delexpense <expense_id>` — удалить трату
-   - `/confirm <from_id> <to_id> <amount>` — подтвердить оплату (фиксируется как settlement)
 
-## Примечания
-- Драйвер `modernc.org/sqlite` не требует CGO.
-- Для production имеет смысл добавить:
-  - Проверки прав (удаление траты только плательщиком/владельцем группы),
-  - Пэйджинг по спискам трат/групп,
-  - Кнопку «Подтвердить оплату» через инлайн, а не командой,
-  - Ограничение на максимальные суммы, валидации,
-  - Логи, трейсинг, резервные копии БД.
+On Windows PowerShell:
+
+```powershell
+$env:BOT_TOKEN = "123456:ABC..."
+python main.py
+```
+
+Optional environment variables:
+
+- `DB_PATH`: SQLite database path, defaults to `./data.db`.
+
+## Data Model
+
+The app applies migrations automatically on startup and records applied versions in `schema_migrations`.
+
+Important permission rules:
+
+- Viewing groups, expenses, members, and payments requires group membership.
+- Adding an expense requires group membership.
+- Deleting an expense requires being the user who created it.
+- Deleting a group requires being the group owner.
+- Cancelling a payment requires being the payer who confirmed it or the group owner.
+
+For old databases, migration `002_expense_created_by` backfills `created_by_tg_id` from `payer_tg_id`.
+
+## Tests
+
+Run unit tests without starting Telegram polling:
+
+```bash
+python -B -m unittest discover -s tests -p "test_*.py"
+```
