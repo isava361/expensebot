@@ -51,6 +51,12 @@ MEMBERS_PER_PAGE = 15
 
 # ---------- Utils ----------
 
+_AMOUNT_WITH_DESC_RE = re.compile(
+    r"^\s*(?P<amount>[+-]?(?:(?:\d{1,3}(?:[ _]\d{3})+|\d+)(?:[.,]\d*)?|[.,]\d+))"
+    r"(?=$|\s)(?:\s+(?P<desc>.*))?$"
+)
+
+
 def now_unix() -> int:
     return int(time.time())
 
@@ -66,21 +72,55 @@ def cents_from_str(s: str) -> int:
         raise ValueError("empty amount")
 
     negative = s.startswith("-")
-    if negative:
+    if s[0] in "+-":
         s = s[1:]
     if not s:
         raise ValueError("empty amount after sign")
 
+    if " " in s or "_" in s:
+        if not re.fullmatch(r"\d{1,3}(?:[ _]\d{3})+(?:\.\d*)?", s):
+            raise ValueError("invalid thousands separator")
+        s = s.replace(" ", "").replace("_", "")
+
+    if s.count(".") > 1:
+        raise ValueError("invalid amount")
+
     if "." in s:
         int_part, frac = s.split(".", 1)
+        if not int_part and not frac:
+            raise ValueError("empty amount")
         int_part = int_part or "0"
-        # Pad to exactly 2 decimal digits (right-pad zeros, truncate if longer)
+        if not int_part.isdigit() or (frac and not frac.isdigit()):
+            raise ValueError("invalid amount")
+        if len(frac) > 2:
+            raise ValueError("too many decimal places")
         frac = (frac + "00")[:2]
         value = int(int_part) * 100 + int(frac)
     else:
+        if not s.isdigit():
+            raise ValueError("invalid amount")
         value = int(s) * 100
 
     return -value if negative else value
+
+
+def split_amount_and_description(text: str) -> tuple[str, str]:
+    match = _AMOUNT_WITH_DESC_RE.match(text)
+    if not match:
+        return "", ""
+    amount = match.group("amount")
+    desc = (match.group("desc") or "").strip()
+    first_desc_token = desc.split(maxsplit=1)[0] if desc else ""
+    plain_amount = amount.lstrip("+-")
+    if (
+        first_desc_token
+        and " " not in amount
+        and "_" not in amount
+        and re.fullmatch(r"\d{1,3}", plain_amount)
+        and re.fullmatch(r"\d[\d.,_]*", first_desc_token)
+    ):
+        return "", ""
+    return amount, desc
 
 
 def format_cents(c: int) -> str:
@@ -182,7 +222,7 @@ CREATE TABLE IF NOT EXISTS settlements(
 
 class Repo:
     def __init__(self, db_path: str):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
@@ -249,6 +289,14 @@ class Repo:
             ).fetchall()
         return [{"id": r["id"], "title": r["title"]} for r in rows]
 
+    def is_group_member(self, group_id: int, uid: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id=? AND tg_id=?",
+                (group_id, uid),
+            ).fetchone()
+        return row is not None
+
     def get_invite_code(self, group_id: int) -> str:
         with self._lock:
             row = self._conn.execute(
@@ -274,6 +322,7 @@ class Repo:
 
     def delete_group(self, group_id: int) -> None:
         with self._lock:
+            self._conn.execute("DELETE FROM settlements WHERE group_id=?", (group_id,))
             self._conn.execute('DELETE FROM "groups" WHERE id=?', (group_id,))
             self._conn.commit()
 
@@ -314,6 +363,16 @@ class Repo:
         if not shares:
             raise ValueError("no participants")
         with self._lock:
+            rows = self._conn.execute(
+                "SELECT tg_id FROM group_members WHERE group_id=?",
+                (group_id,),
+            ).fetchall()
+            members = {r["tg_id"] for r in rows}
+            if payer not in members:
+                raise ValueError("payer is not a group member")
+            if not set(shares).issubset(members):
+                raise ValueError("expense participant is not a group member")
+
             cur = self._conn.execute(
                 "INSERT INTO expenses(group_id,payer_tg_id,description,amount_cents,created_at)"
                 " VALUES(?,?,?,?,?)",
@@ -334,6 +393,21 @@ class Repo:
                 "UPDATE expenses SET deleted=1 WHERE id=?", (expense_id,)
             )
             self._conn.commit()
+
+    def can_delete_expense(self, expense_id: int, group_id: int, uid: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT e.payer_tg_id, g.owner_tg_id"
+                " FROM expenses e"
+                ' JOIN "groups" g ON g.id=e.group_id'
+                " WHERE e.id=? AND e.group_id=? AND e.deleted=0",
+                (expense_id, group_id),
+            ).fetchone()
+        if row is None:
+            return False
+        if not self.is_group_member(group_id, uid):
+            return False
+        return uid in (row["payer_tg_id"], row["owner_tg_id"])
 
     def get_expense_shares(self, expense_id: int) -> dict:
         with self._lock:
@@ -483,6 +557,30 @@ class Repo:
                 (group_id, from_uid, to_uid, amount_cents, 1, now_unix()),
             )
             self._conn.commit()
+
+    def add_settlement_if_current(
+        self, group_id: int, from_uid: int, to_uid: int, amount_cents: int
+    ) -> bool:
+        with self._lock:
+            if amount_cents <= 0:
+                return False
+            if not self.is_group_member(group_id, from_uid):
+                return False
+            if not self.is_group_member(group_id, to_uid):
+                return False
+
+            current = self.compute_group_balances(group_id).get((from_uid, to_uid), 0)
+            if current != amount_cents:
+                return False
+
+            self._conn.execute(
+                "INSERT INTO settlements"
+                "(group_id,from_tg_id,to_tg_id,amount_cents,confirmed_by_to,created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (group_id, from_uid, to_uid, amount_cents, 1, now_unix()),
+            )
+            self._conn.commit()
+            return True
 
 
 # ---------- Keyboards ----------
@@ -749,7 +847,7 @@ class App:
             enc = quote(f"/join {code}", safe="")
             share_href = f"https://t.me/share/url?url={enc}"
             html_join = f'<a href="{share_href}">/join {code}</a>'
-            text = f"Группа #{gid} создана: {title}\nКоманда: {html_join}"
+            text = f"Группа #{gid} создана: {html.escape(title)}\nКоманда: {html_join}"
             await update.effective_chat.send_message(
                 text,
                 reply_markup=main_keyboard(),
@@ -817,15 +915,15 @@ class App:
         step = st.get("step")
 
         if step == "await_amount_desc":
-            parts = txt.split()
-            if not parts:
+            amount_text, description = split_amount_and_description(txt)
+            if not amount_text:
                 await update.effective_chat.send_message(
                     "Нужно прислать сумму и описание. Пример: 1200 обед",
                     reply_markup=inline_cancel(),
                 )
                 return
             try:
-                amt = cents_from_str(parts[0])
+                amt = cents_from_str(amount_text)
                 if amt <= 0:
                     raise ValueError("non-positive")
             except Exception:
@@ -836,9 +934,7 @@ class App:
                 return
 
             st["amount_cents"] = amt
-            st["description"] = (
-                txt[len(parts[0]):].strip() if len(parts) > 1 else "Без описания"
-            )
+            st["description"] = description or "Без описания"
             st["step"] = "choose_payer"
             _set_ae(ctx, st)
             await self._ask_payer(update, ctx, st)
@@ -962,18 +1058,27 @@ class App:
         # Group selection
         if data.startswith("mgsel|"):
             gid = int(data[len("mgsel|"):])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
             await self._send_group_details(update, ctx, gid)
             await query.answer()
             return
 
         if data.startswith("invsel|"):
             gid = int(data[len("invsel|"):])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
             await self._send_invite_for_group(update, gid)
             await query.answer("Выберите чат для отправки")
             return
 
         if data.startswith("aesel|"):
             gid = int(data[len("aesel|"):])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
             _set_ae(ctx, {
                 "group_id": gid,
                 "amount_cents": 0,
@@ -998,7 +1103,11 @@ class App:
             if len(parts) >= 3 and parts[2].startswith("p:"):
                 gid = int(parts[1])
                 page = int(parts[2][2:])
-                await self._send_expenses_page(update, ctx, gid, page)
+                if self.repo.is_group_member(gid, uid):
+                    await self._send_expenses_page(update, ctx, gid, page)
+                else:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
             await query.answer()
             return
 
@@ -1017,6 +1126,9 @@ class App:
                 gid = int(parts[2][4:])
                 page = int(parts[3][2:])
                 try:
+                    if not self.repo.can_delete_expense(eid, gid, uid):
+                        await query.answer("Нет прав на удаление", show_alert=True)
+                        return
                     self.repo.delete_expense(eid)
                     await query.answer("Удалено")
                     await self._send_expenses_page(update, ctx, gid, page)
@@ -1039,7 +1151,11 @@ class App:
                 to = int(parts[2][3:])
                 amt = int(parts[3][4:])
                 try:
-                    self.repo.add_settlement(gid, uid, to, amt)
+                    if not self.repo.add_settlement_if_current(gid, uid, to, amt):
+                        await query.answer("Оплата уже не актуальна", show_alert=True)
+                        if self.repo.is_group_member(gid, uid):
+                            await self._send_group_details(update, ctx, gid)
+                        return
                     from_name = self.repo.user_name(uid)
                     title = self.repo.get_group_title(gid)
                     try:
@@ -1087,6 +1203,9 @@ class App:
 
         if data.startswith("grpdelyes|"):
             gid = int(data[len("grpdelyes|gid:"):])
+            if not self.repo.is_group_owner(gid, uid):
+                await query.answer("Только владелец может удалить группу", show_alert=True)
+                return
             try:
                 self.repo.delete_group(gid)
                 await query.answer("Группа удалена")
@@ -1104,7 +1223,11 @@ class App:
             if len(parts) >= 3 and parts[2].startswith("p:"):
                 gid = int(parts[1])
                 page = int(parts[2][2:])
-                await self._send_members_page(update, gid, page)
+                if self.repo.is_group_member(gid, uid):
+                    await self._send_members_page(update, gid, page)
+                else:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
             await query.answer()
             return
 
@@ -1113,9 +1236,18 @@ class App:
         if st is None:
             await query.answer()
             return
+        group_id = st.get("group_id")
+        if not self.repo.is_group_member(group_id, uid):
+            _del_ae(ctx)
+            await query.answer("Нет доступа", show_alert=True)
+            return
 
         if data.startswith("payer|"):
-            st["payer"] = int(data[len("payer|"):])
+            payer = int(data[len("payer|"):])
+            if not self.repo.is_group_member(group_id, payer):
+                await query.answer("Нет доступа", show_alert=True)
+                return
+            st["payer"] = payer
             st["step"] = "choose_participants"
             _set_ae(ctx, st)
             await query.answer("Плательщик выбран")
@@ -1124,6 +1256,9 @@ class App:
 
         if data.startswith("toggle|"):
             pid = int(data[len("toggle|"):])
+            if not self.repo.is_group_member(group_id, pid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
             st["participants"][pid] = not st["participants"].get(pid, False)
             _set_ae(ctx, st)
             await query.answer()
@@ -1405,6 +1540,11 @@ class App:
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict
     ) -> None:
         uid = update.effective_user.id
+        group_id = st["group_id"]
+        if not self.repo.is_group_member(group_id, uid):
+            _del_ae(ctx)
+            await self._edit_or_send(update, "Нет доступа к группе.")
+            return
 
         if st["split_mode"] == "equal":
             participants = [pid for pid, on in st["participants"].items() if on]
@@ -1434,9 +1574,16 @@ class App:
                 )
                 return
 
+        if not self.repo.is_group_member(group_id, st["payer"]) or any(
+            not self.repo.is_group_member(group_id, pid) for pid in shares
+        ):
+            _del_ae(ctx)
+            await self._edit_or_send(update, "Участник не найден в группе. Начните заново.")
+            return
+
         try:
             expense_id = self.repo.create_expense(
-                st["group_id"],
+                group_id,
                 st["payer"],
                 st["description"],
                 st["amount_cents"],
@@ -1450,14 +1597,14 @@ class App:
 
         # Notify other participants of their share
         expense_shares = self.repo.get_expense_shares(expense_id)
-        title = self.repo.get_group_title(st["group_id"])
+        title = self.repo.get_group_title(group_id)
         for pid, share in expense_shares.items():
             if pid == uid:
                 continue
             try:
                 await ctx.bot.send_message(
                     pid,
-                    f"В группе #{st['group_id']} ({title}) добавлена трата:"
+                    f"В группе #{group_id} ({title}) добавлена трата:"
                     f" {st['description']} — {format_cents(st['amount_cents'])}.\n"
                     f"Ваша доля: {format_cents(share)}."
                     f" Плательщик: {self.repo.user_name(st['payer'])}.",
