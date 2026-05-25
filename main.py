@@ -636,6 +636,7 @@ class App:
 
     async def on_join(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id
+        self.repo.upsert_user(uid, self._best_name(update.effective_user))
         # PTB strips the /join@botname prefix automatically; ctx.args has the rest
         args = ctx.args or []
         code = ""
@@ -666,6 +667,7 @@ class App:
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         txt = (update.effective_message.text or "").strip()
         uid = update.effective_user.id
+        self.repo.upsert_user(uid, self._best_name(update.effective_user))
 
         # Block top-level buttons while wizard is active
         if (_is_new_group(ctx) or _get_ae(ctx)) and txt in _TOP_BUTTONS:
@@ -929,6 +931,7 @@ class App:
     async def on_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        self.repo.upsert_user(update.effective_user.id, self._best_name(update.effective_user))
         query = update.callback_query
         data = query.data
         uid = update.effective_user.id
