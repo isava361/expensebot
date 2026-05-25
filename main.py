@@ -677,9 +677,39 @@ class App:
             )
             return
 
-        # /start@<code> or /start_<code>
-        if txt.startswith("/start@") or txt.startswith("/start_"):
-            code = txt.removeprefix("/start@").removeprefix("/start_").strip()
+        in_wizard = _is_new_group(ctx) or _get_ae(ctx) is not None
+
+        if not in_wizard:
+            # /start@<code> or /start_<code>
+            if txt.startswith("/start@") or txt.startswith("/start_"):
+                code = txt.removeprefix("/start@").removeprefix("/start_").strip()
+                if code:
+                    try:
+                        gid, title = self.repo.join_by_code(code, uid)
+                        await update.effective_chat.send_message(
+                            f"Вы присоединились к группе #{gid}: {title}",
+                            reply_markup=main_keyboard(),
+                        )
+                        return
+                    except Exception:
+                        pass
+
+            # /join_<code>
+            if txt.startswith("/join_"):
+                fields = txt.removeprefix("/join_").split()
+                if fields:
+                    try:
+                        gid, title = self.repo.join_by_code(fields[0], uid)
+                        await update.effective_chat.send_message(
+                            f"Вы присоединились к группе #{gid}: {title}",
+                            reply_markup=main_keyboard(),
+                        )
+                        return
+                    except Exception:
+                        pass
+
+            # URL containing ?start=<code>
+            code = extract_start_code_from_text(txt)
             if code:
                 try:
                     gid, title = self.repo.join_by_code(code, uid)
@@ -691,12 +721,11 @@ class App:
                 except Exception:
                     pass
 
-        # /join_<code>
-        if txt.startswith("/join_"):
-            fields = txt.removeprefix("/join_").split()
-            if fields:
+            # Bare invite code
+            code = extract_bare_code(txt)
+            if code:
                 try:
-                    gid, title = self.repo.join_by_code(fields[0], uid)
+                    gid, title = self.repo.join_by_code(code, uid)
                     await update.effective_chat.send_message(
                         f"Вы присоединились к группе #{gid}: {title}",
                         reply_markup=main_keyboard(),
@@ -704,32 +733,6 @@ class App:
                     return
                 except Exception:
                     pass
-
-        # URL containing ?start=<code>
-        code = extract_start_code_from_text(txt)
-        if code:
-            try:
-                gid, title = self.repo.join_by_code(code, uid)
-                await update.effective_chat.send_message(
-                    f"Вы присоединились к группе #{gid}: {title}",
-                    reply_markup=main_keyboard(),
-                )
-                return
-            except Exception:
-                pass
-
-        # Bare invite code
-        code = extract_bare_code(txt)
-        if code:
-            try:
-                gid, title = self.repo.join_by_code(code, uid)
-                await update.effective_chat.send_message(
-                    f"Вы присоединились к группе #{gid}: {title}",
-                    reply_markup=main_keyboard(),
-                )
-                return
-            except Exception:
-                pass
 
         # New group name input
         if _is_new_group(ctx):
@@ -1128,6 +1131,9 @@ class App:
             return
 
         if data == "part_done":
+            if not any(st["participants"].values()):
+                await query.answer("Выберите хотя бы одного участника!", show_alert=True)
+                return
             st["step"] = "choose_split"
             _set_ae(ctx, st)
             await query.answer()
@@ -1403,6 +1409,7 @@ class App:
         if st["split_mode"] == "equal":
             participants = [pid for pid, on in st["participants"].items() if on]
             if not participants:
+                _del_ae(ctx)
                 await self._edit_or_send(
                     update, "Нет участников. Нажмите /cancel и начните заново."
                 )
@@ -1420,6 +1427,7 @@ class App:
         else:
             shares = st.get("custom_shares", {})
             if sum(shares.values()) != st["amount_cents"]:
+                _del_ae(ctx)
                 await self._edit_or_send(
                     update,
                     "Сумма долей не равна общей сумме. Нажмите /cancel и начните заново.",
