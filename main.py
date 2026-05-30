@@ -1817,18 +1817,35 @@ class App:
             )
             return
 
-        lines = ["Ваши долги по группам:\n"]
+        lines = ["Балансы по группам:\n"]
         for g in gs:
             bal = self.repo.compute_group_balances(g["id"])
-            count = 0
+            you_owe, owe_you = [], []
             for (frm, to), v in bal.items():
-                if v > 0 and frm == uid:
-                    if count == 0:
-                        lines.append(f"— #{g['id']} {g['title']}\n")
-                    lines.append(f"   вы → {self.repo.user_name(to)}: {format_cents(v)}\n")
-                    count += 1
-            if count == 0:
+                if v <= 0:
+                    continue
+                if frm == uid:
+                    you_owe.append(
+                        f"   вы → {self.repo.user_name(to)}: {format_cents(v)}\n"
+                    )
+                elif to == uid:
+                    owe_you.append(
+                        f"   {self.repo.user_name(frm)} → вам: {format_cents(v)}\n"
+                    )
+            you_owe.sort()
+            owe_you.sort()
+
+            if not you_owe and not owe_you:
                 lines.append(f"— #{g['id']} {g['title']}: долгов нет\n")
+                continue
+
+            lines.append(f"— #{g['id']} {g['title']}\n")
+            if owe_you:
+                lines.append("  Вам должны:\n")
+                lines.extend(owe_you)
+            if you_owe:
+                lines.append("  Вы должны:\n")
+                lines.extend(you_owe)
 
         await update.effective_chat.send_message("".join(lines))
 
