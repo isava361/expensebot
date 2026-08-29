@@ -557,43 +557,73 @@ class Repo:
         """
         return settle_net(self._net_positions(group_id))
 
-    def compute_cross_group_net(self, uid: int) -> dict:
-        """Same simplification, but over every group the user belongs to."""
+    def compute_user_debts(self, uid: int) -> dict[int, dict]:
+        """What ``uid`` owes and is owed, per counterparty, across groups.
+
+        Returns ``{other_uid: {"net": cents, "by_group": {gid: cents}}}``
+        where a positive amount means the counterparty owes ``uid`` and a
+        negative one means ``uid`` owes them. Debts in opposite directions
+        cancel: owing someone 50 in one group while they owe 50 in another
+        nets to zero, and there is genuinely nothing to transfer.
+
+        Only pairs that share a group can appear here, because every entry
+        comes from a single group's simplified balances.
+        """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT group_id FROM group_members WHERE tg_id=?", (uid,)
             ).fetchall()
-        gids = [r["group_id"] for r in rows]
 
-        net: dict[int, int] = {}
-        for gid in gids:
-            for member, v in self._net_positions(gid).items():
-                net[member] = net.get(member, 0) + v
+        result: dict[int, dict] = {}
+        for r in rows:
+            gid = r["group_id"]
+            for (frm, to), amount in self.compute_group_balances(gid).items():
+                if frm == uid:
+                    other, delta = to, -amount
+                elif to == uid:
+                    other, delta = frm, amount
+                else:
+                    continue
+                entry = result.setdefault(other, {"net": 0, "by_group": {}})
+                entry["net"] += delta
+                entry["by_group"][gid] = entry["by_group"].get(gid, 0) + delta
 
-        return settle_net({m: v for m, v in net.items() if v != 0})
+        return result
 
     # -- settlements --
 
-    def add_settlement_if_current(
-        self, group_id: int, from_uid: int, to_uid: int, amount_cents: int
-    ) -> bool:
+    def settle_with_user(self, uid: int, other: int, amount_cents: int) -> bool:
+        """Close every debt between ``uid`` and ``other`` in one go.
+
+        ``amount_cents`` is the net that ``uid`` hands over; it must still
+        match the live net, so a stale button does nothing. Debts are
+        closed in every shared group and in both directions, so the two
+        halves of a cross-group offset disappear together instead of one
+        being paid twice. A net of zero is allowed and settles nothing but
+        the bookkeeping: the debts cancelled out, so no money moves.
+        """
         with self._lock:
-            if amount_cents <= 0:
+            entry = self.compute_user_debts(uid).get(other)
+            if entry is None:
                 return False
-            if not self.is_group_member(group_id, from_uid):
-                return False
-            if not self.is_group_member(group_id, to_uid):
-                return False
-
-            current = self.compute_group_balances(group_id).get((from_uid, to_uid), 0)
-            if current != amount_cents:
+            if amount_cents < 0 or amount_cents != -entry["net"]:
                 return False
 
-            self._conn.execute(
+            rows = []
+            for gid, delta in entry["by_group"].items():
+                if delta < 0:
+                    rows.append((gid, uid, other, -delta))
+                elif delta > 0:
+                    rows.append((gid, other, uid, delta))
+            if not rows:
+                return False
+
+            ts = now_unix()
+            self._conn.executemany(
                 "INSERT INTO settlements"
                 "(group_id,from_tg_id,to_tg_id,amount_cents,confirmed_by_to,created_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (group_id, from_uid, to_uid, amount_cents, 1, now_unix()),
+                " VALUES(?,?,?,?,1,?)",
+                [(gid, frm, to, amt, ts) for gid, frm, to, amt in rows],
             )
             self._conn.commit()
             return True
@@ -653,9 +683,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🧾 Добавить трату")],
-            [KeyboardButton("📊 Балансы"), KeyboardButton("🔄 Взаимозачёт")],
-            [KeyboardButton("👥 Мои группы"), KeyboardButton("🔗 Приглашение")],
-            [KeyboardButton("➕ Создать группу")],
+            [KeyboardButton("💰 Долги"), KeyboardButton("👥 Мои группы")],
+            [KeyboardButton("🔗 Приглашение"), KeyboardButton("➕ Создать группу")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -694,7 +723,7 @@ def _set_new_group(ctx: ContextTypes.DEFAULT_TYPE, v: bool) -> None:
 
 _TOP_BUTTONS = {
     "➕ Создать группу", "👥 Мои группы", "🔗 Приглашение",
-    "🧾 Добавить трату", "📊 Балансы", "🔄 Взаимозачёт",
+    "🧾 Добавить трату", "💰 Долги",
 }
 
 
@@ -963,10 +992,8 @@ class App:
                 await update.effective_chat.send_message(
                     "Выберите группу для добавления траты:", reply_markup=markup
                 )
-        elif txt == "📊 Балансы":
-            await self._show_balances_all(update, ctx)
-        elif txt == "🔄 Взаимозачёт":
-            await self._show_cross_net(update, ctx)
+        elif txt == "💰 Долги":
+            await self._show_debts(update, ctx)
 
     # ---------- Add-expense wizard (text steps) ----------
 
@@ -1203,48 +1230,58 @@ class App:
             await query.answer("Ошибка удаления")
             return
 
-        # Confirm payment
-        if data.startswith("pay|"):
+        # Open the unified debts screen
+        if data == "debts":
+            await self._show_debts(update, ctx)
+            await query.answer()
+            return
+
+        # Settle everything with one counterparty, across all shared groups
+        if data.startswith("paynet|"):
             parts = data.split("|")
             if (
-                len(parts) == 4
-                and parts[1].startswith("gid:")
-                and parts[2].startswith("to:")
-                and parts[3].startswith("amt:")
+                len(parts) == 3
+                and parts[1].startswith("to:")
+                and parts[2].startswith("amt:")
             ):
-                gid = int(parts[1][4:])
-                to = int(parts[2][3:])
-                amt = int(parts[3][4:])
+                to = int(parts[1][3:])
+                amt = int(parts[2][4:])
                 try:
-                    if not self.repo.add_settlement_if_current(gid, uid, to, amt):
-                        await query.answer("Оплата уже не актуальна", show_alert=True)
-                        if self.repo.is_group_member(gid, uid):
-                            await self._send_group_details(update, ctx, gid)
+                    if not self.repo.settle_with_user(uid, to, amt):
+                        await query.answer("Расчёт уже не актуален", show_alert=True)
+                        try:
+                            await self._show_debts(update, ctx)
+                        except Exception:
+                            logger.info("failed to refresh stale debts screen")
                         return
                     from_name = self.repo.user_name(uid)
-                    title = self.repo.get_group_title(gid)
-                    try:
-                        await ctx.bot.send_message(
-                            to,
-                            f"Вам оплатили {format_cents(amt)} от {from_name}"
-                            f" в группе #{gid} ({title}).",
-                        )
-                    except Exception:
-                        logger.info("failed to notify payment receiver %s", to)
-                    try:
-                        await ctx.bot.send_message(
-                            uid,
-                            f"Оплата {format_cents(amt)} пользователю"
-                            f" {self.repo.user_name(to)} в группе #{gid}"
-                            f" ({title}) зафиксирована.",
-                        )
-                    except Exception:
-                        logger.info("failed to notify payment sender %s", uid)
-                    await query.answer("Оплата подтверждена")
-                    await self._send_group_details(update, ctx, gid)
+                    to_name = self.repo.user_name(to)
+                    if amt > 0:
+                        for chat, text in (
+                            (to, f"Вам оплатили {format_cents(amt)} от {from_name}."
+                                 f" Все взаимные долги закрыты."),
+                            (uid, f"Оплата {format_cents(amt)} пользователю {to_name}"
+                                  f" зафиксирована. Все взаимные долги закрыты."),
+                        ):
+                            try:
+                                await ctx.bot.send_message(chat, text)
+                            except Exception:
+                                logger.info("failed to notify %s about payment", chat)
+                        await query.answer("Оплата подтверждена")
+                    else:
+                        try:
+                            await ctx.bot.send_message(
+                                to,
+                                f"{from_name} закрыл(а) взаимные расчёты с вами:"
+                                f" долги погасили друг друга, переводить нечего.",
+                            )
+                        except Exception:
+                            logger.info("failed to notify %s about netting", to)
+                        await query.answer("Взаимные долги закрыты")
+                    await self._show_debts(update, ctx)
                     return
                 except Exception:
-                    logger.exception("failed to confirm payment")
+                    logger.exception("failed to settle with user")
             await query.answer("Ошибка подтверждения")
             return
 
@@ -1467,8 +1504,8 @@ class App:
             if owe_you:
                 lines.append("Вам должны:\n• " + "\n• ".join(owe_you))
             lines.append(
-                "\n\nДолги сведены в цепочки: если вы должны участнику,"
-                " который должен третьему, платить нужно сразу третьему."
+                "\n\nЭто долги только по этой группе. Платить нужно по"
+                " итогу всех групп — откройте «💰 Долги»."
             )
         text = "".join(lines)
 
@@ -1476,6 +1513,7 @@ class App:
         # the rest is paired up to keep the keyboard short.
         rows = [
             [InlineKeyboardButton("🧾 Добавить трату", callback_data=f"aesel|{gid}")],
+            [InlineKeyboardButton("💰 Долги", callback_data="debts")],
             [
                 InlineKeyboardButton("📋 Список трат", callback_data=f"explist|{gid}|p:0"),
                 InlineKeyboardButton("💸 Платежи", callback_data=f"setlist|{gid}|p:0"),
@@ -1492,16 +1530,6 @@ class App:
         rows.append([InlineKeyboardButton(
             "« Мои группы", callback_data="mg|p:0"
         )])
-
-        confirm_rows = []
-        for (frm, to), v in bal.items():
-            if v > 0 and frm == uid:
-                confirm_rows.append([InlineKeyboardButton(
-                    f"Подтвердить оплату → {self.repo.user_name(to)} ({format_cents(v)})",
-                    callback_data=f"pay|gid:{gid}|to:{to}|amt:{v}",
-                )])
-        if confirm_rows:
-            rows = confirm_rows + rows
 
         markup = InlineKeyboardMarkup(rows)
         opts = dict(
@@ -1825,83 +1853,77 @@ class App:
 
     # ---------- Balance screens ----------
 
-    async def _show_balances_all(
+    def _debt_block(self, uid: int, entry: dict) -> str:
+        """Per-group detail under one counterparty, so the net is not a
+        black box: it shows which group each part came from."""
+        parts = []
+        for gid, delta in sorted(entry["by_group"].items()):
+            if delta == 0:
+                continue
+            title = self.repo.get_group_title(gid)
+            side = "вам" if delta > 0 else "вы"
+            parts.append(f"    #{gid} {title}: {side} {format_cents(abs(delta))}\n")
+        return "".join(parts)
+
+    async def _show_debts(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
         uid = update.effective_user.id
-        gs = self.repo.list_user_groups(uid)
-        if not gs:
+        if not self.repo.list_user_groups(uid):
             await update.effective_chat.send_message(
                 "У вас нет групп. Нажмите «Создать группу»."
             )
             return
 
-        lines = ["Балансы по группам:\n"]
-        for g in gs:
-            bal = self.repo.compute_group_balances(g["id"])
-            you_owe, owe_you = [], []
-            for (frm, to), v in bal.items():
-                if v <= 0:
-                    continue
-                if frm == uid:
-                    you_owe.append(
-                        f"   вы → {self.repo.user_name(to)}: {format_cents(v)}\n"
-                    )
-                elif to == uid:
-                    owe_you.append(
-                        f"   {self.repo.user_name(frm)} → вам: {format_cents(v)}\n"
-                    )
-            you_owe.sort()
-            owe_you.sort()
+        debts = self.repo.compute_user_debts(uid)
+        entries = sorted(
+            debts.items(), key=lambda kv: self.repo.user_name(kv[0]).lower()
+        )
 
-            if not you_owe and not owe_you:
-                lines.append(f"— #{g['id']} {g['title']}: долгов нет\n")
+        you_owe, owe_you, even = [], [], []
+        for other, entry in entries:
+            detail = self._debt_block(uid, entry)
+            if not detail:
                 continue
+            name = self.repo.user_name(other)
+            net = entry["net"]
+            if net < 0:
+                you_owe.append((other, -net, name, detail))
+            elif net > 0:
+                owe_you.append((other, net, name, detail))
+            else:
+                even.append((other, name, detail))
 
-            lines.append(f"— #{g['id']} {g['title']}\n")
-            if owe_you:
-                lines.append("  Вам должны:\n")
-                lines.extend(owe_you)
-            if you_owe:
-                lines.append("  Вы должны:\n")
-                lines.extend(you_owe)
+        lines = ["💰 Долги по всем группам\n"]
+        if not you_owe and not owe_you and not even:
+            lines.append("\nДолгов нет 🎉")
+        if you_owe:
+            lines.append("\nВы должны:\n")
+            for _, amount, name, detail in you_owe:
+                lines.append(f"• {name} — {format_cents(amount)}\n{detail}")
+        if owe_you:
+            lines.append("\nВам должны:\n")
+            for _, amount, name, detail in owe_you:
+                lines.append(f"• {name} — {format_cents(amount)}\n{detail}")
+        if even:
+            lines.append("\nВы в расчёте (долги погасили друг друга):\n")
+            for _, name, detail in even:
+                lines.append(f"• {name}\n{detail}")
 
-        await update.effective_chat.send_message("".join(lines))
+        rows = []
+        for other, amount, name, _ in you_owe:
+            rows.append([InlineKeyboardButton(
+                f"Оплатил(а) {name}: {format_cents(amount)}",
+                callback_data=f"paynet|to:{other}|amt:{amount}",
+            )])
+        for other, name, _ in even:
+            rows.append([InlineKeyboardButton(
+                f"✅ Закрыть расчёты с {name}",
+                callback_data=f"paynet|to:{other}|amt:0",
+            )])
 
-    async def _show_cross_net(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        uid = update.effective_user.id
-        all_bal = self.repo.compute_cross_group_net(uid)
-
-        if not all_bal:
-            await update.effective_chat.send_message(
-                "По всем группам взаимозачёт = 0. Никто никому не должен ✨"
-            )
-            return
-
-        you_owe, owe_you = [], []
-        for (frm, to), v in all_bal.items():
-            if v <= 0:
-                continue
-            if frm == uid:
-                you_owe.append(f"вы → {self.repo.user_name(to)}: {format_cents(v)}")
-            elif to == uid:
-                owe_you.append(f"{self.repo.user_name(frm)} → вам: {format_cents(v)}")
-        you_owe.sort()
-        owe_you.sort()
-
-        lines = ["Взаимозачёт по всем группам:\n"]
-        if not you_owe and not owe_you:
-            lines.append("Никто никому не должен 🎉")
-        else:
-            if you_owe:
-                lines.append("Вы должны:\n• " + "\n• ".join(you_owe) + "\n")
-            if owe_you:
-                lines.append("Вам должны:\n• " + "\n• ".join(owe_you))
-
-        await update.effective_chat.send_message("".join(lines))
-
+        markup = InlineKeyboardMarkup(rows) if rows else None
+        await self._edit_or_send(update, "".join(lines), markup)
 
 # ---------- Entry point ----------
 

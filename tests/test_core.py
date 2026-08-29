@@ -97,9 +97,9 @@ class RepoTest(unittest.TestCase):
         repo.create_expense(gid, 2, 1, "hotel", 1000, {1: 500, 2: 500})
 
         self.assertEqual(repo.compute_group_balances(gid), {(2, 1): 500})
-        self.assertTrue(repo.add_settlement_if_current(gid, 2, 1, 500))
+        self.assertTrue(repo.settle_with_user(2, 1, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
-        self.assertFalse(repo.add_settlement_if_current(gid, 2, 1, 500))
+        self.assertFalse(repo.settle_with_user(2, 1, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
 
     def test_chained_debts_are_simplified_across_the_group(self):
@@ -122,29 +122,73 @@ class RepoTest(unittest.TestCase):
         repo.create_expense(gid, 3, 3, "кофе", 1000, {2: 500, 3: 500})
 
         self.assertEqual(repo.compute_group_balances(gid), {(1, 3): 500})
-        self.assertFalse(repo.add_settlement_if_current(gid, 1, 2, 500))
-        self.assertTrue(repo.add_settlement_if_current(gid, 1, 3, 500))
+        self.assertFalse(repo.settle_with_user(1, 2, 500))
+        self.assertTrue(repo.settle_with_user(1, 3, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
 
-    def test_cross_group_net_chains_between_groups(self):
+    def make_two_groups(self):
+        """Users 1 and 2 share two groups; user 3 only shares the second."""
         repo, g1 = self.make_repo()
         _, code2 = repo.create_group("flat", 1)
         repo.join_by_code(code2, 2)
         repo.join_by_code(code2, 3)
         g2 = max(g["id"] for g in repo.list_user_groups(1))
+        return repo, g1, g2
 
-        # 1 owes 2 in the first group, 2 owes 3 in the second one.
-        repo.create_expense(g1, 2, 2, "обед", 1000, {1: 500, 2: 500})
-        repo.create_expense(g2, 3, 3, "кофе", 1000, {2: 500, 3: 500})
+    def test_opposite_debts_in_two_groups_cancel_out(self):
+        repo, g1, g2 = self.make_two_groups()
+        # 2 pays in the first group, 1 pays the same amount in the second.
+        repo.create_expense(g1, 2, 2, "бензин", 1000, {1: 500, 2: 500})
+        repo.create_expense(g2, 1, 1, "интернет", 1000, {1: 500, 2: 500})
 
         self.assertEqual(repo.compute_group_balances(g1), {(1, 2): 500})
-        self.assertEqual(repo.compute_group_balances(g2), {(2, 3): 500})
-        self.assertEqual(repo.compute_cross_group_net(1), {(1, 3): 500})
+        self.assertEqual(repo.compute_group_balances(g2), {(2, 1): 500})
+
+        debts = repo.compute_user_debts(1)
+        self.assertEqual(debts[2]["net"], 0)
+        self.assertEqual(debts[2]["by_group"], {g1: -500, g2: 500})
+
+        # Nothing to transfer, but closing the books clears both groups.
+        self.assertFalse(repo.settle_with_user(1, 2, 500))
+        self.assertTrue(repo.settle_with_user(1, 2, 0))
+        self.assertEqual(repo.compute_group_balances(g1), {})
+        self.assertEqual(repo.compute_group_balances(g2), {})
+        self.assertEqual(repo.compute_user_debts(1), {})
+
+    def test_partially_offsetting_debts_settle_in_one_payment(self):
+        repo, g1, g2 = self.make_two_groups()
+        # 1 owes 2 fifty in g1; 2 owes 1 twenty in g2 -> net thirty.
+        repo.create_expense(g1, 2, 2, "бензин", 1000, {1: 500, 2: 500})
+        repo.create_expense(g2, 1, 1, "интернет", 400, {1: 200, 2: 200})
+
+        self.assertEqual(repo.compute_user_debts(1)[2]["net"], -300)
+        self.assertFalse(repo.settle_with_user(1, 2, 500))
+        self.assertTrue(repo.settle_with_user(1, 2, 300))
+        self.assertEqual(repo.compute_user_debts(1), {})
+        self.assertEqual(repo.compute_group_balances(g1), {})
+        self.assertEqual(repo.compute_group_balances(g2), {})
+
+    def test_debts_never_pair_users_without_a_shared_group(self):
+        repo, _ = self.make_repo()
+        _, code2 = repo.create_group("solo", 1)
+        repo.join_by_code(code2, 4)
+        g_a = max(g["id"] for g in repo.list_user_groups(2))
+        g_b = max(g["id"] for g in repo.list_user_groups(1))
+
+        # 1 owes 2 in one group; 4 owes 1 in another. 2 and 4 never meet.
+        repo.create_expense(g_a, 2, 2, "обед", 1000, {1: 500, 2: 500})
+        repo.create_expense(g_b, 1, 1, "такси", 1000, {1: 500, 4: 500})
+
+        debts = repo.compute_user_debts(1)
+        self.assertEqual(debts[2]["net"], -500)
+        self.assertEqual(debts[4]["net"], 500)
+        self.assertNotIn(4, repo.compute_user_debts(2))
+        self.assertNotIn(2, repo.compute_user_debts(4))
 
     def test_settlement_history_and_cancel(self):
         repo, gid = self.make_repo()
         repo.create_expense(gid, 2, 1, "hotel", 1000, {1: 500, 2: 500})
-        self.assertTrue(repo.add_settlement_if_current(gid, 2, 1, 500))
+        self.assertTrue(repo.settle_with_user(2, 1, 500))
 
         items = repo.list_group_settlements(gid, 10, 0)
         self.assertEqual(len(items), 1)
