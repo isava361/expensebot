@@ -7,7 +7,8 @@ Python Telegram bot for splitting group expenses with SQLite storage.
 - Groups with invite links and join codes.
 - Expense wizard with inline buttons: payer, participants, equal/custom split.
 - Fast participant selection: all, me and payer, clear.
-- Group balances and cross-group netting.
+- Group balances with chained debt simplification: if A owes B and B owes C, B drops out and A pays C directly.
+- Cross-group netting over every group the user belongs to.
 - Idempotent payment confirmation from inline buttons.
 - Payment history with cancellation by payer or group owner.
 - Expense deletion by the user who created the expense.

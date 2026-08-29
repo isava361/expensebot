@@ -172,6 +172,51 @@ def extract_bare_code(raw: str) -> str:
     return s if _CODE_RE.fullmatch(s) else ""
 
 
+# ---------- Debt netting ----------
+
+def settle_net(net: dict[int, int]) -> dict[tuple[int, int], int]:
+    """Turn per-user net positions into a minimal set of directed debts.
+
+    ``net`` maps a user id to their balance in cents: positive means the
+    group owes them, negative means they owe the group. The sum over all
+    users is zero.
+
+    Debts are chained through intermediaries, not just netted pairwise: if
+    A owes B and B owes C, B drops out and A pays C directly. The greedy
+    largest-debtor/largest-creditor matching keeps the number of transfers
+    small and is deterministic for a given ``net``, which matters because
+    the payment buttons carry the computed amount and are re-validated
+    against a freshly computed balance.
+    """
+    debtors = sorted(
+        ((uid, -v) for uid, v in net.items() if v < 0),
+        key=lambda t: (-t[1], t[0]),
+    )
+    creditors = sorted(
+        ((uid, v) for uid, v in net.items() if v > 0),
+        key=lambda t: (-t[1], t[0]),
+    )
+
+    result: dict[tuple[int, int], int] = {}
+    i = j = 0
+    while i < len(debtors) and j < len(creditors):
+        debtor, owed = debtors[i]
+        creditor, due = creditors[j]
+        amount = min(owed, due)
+        key = (debtor, creditor)
+        result[key] = result.get(key, 0) + amount
+        owed -= amount
+        due -= amount
+        debtors[i] = (debtor, owed)
+        creditors[j] = (creditor, due)
+        if owed == 0:
+            i += 1
+        if due == 0:
+            j += 1
+
+    return result
+
+
 # ---------- Repo ----------
 
 class Repo:
@@ -471,102 +516,61 @@ class Repo:
 
     # -- balances --
 
-    def compute_group_balances(self, group_id: int) -> dict:
-        """Returns {(from_uid, to_uid): amount_cents} for net unpaid debts."""
+    def _net_positions(self, group_id: int) -> dict[int, int]:
+        """Per-user balance in one group: positive = the group owes them."""
         with self._lock:
-            expense_rows = self._conn.execute(
-                "SELECT id, payer_tg_id, amount_cents"
-                " FROM expenses WHERE group_id=? AND deleted=0",
+            share_rows = self._conn.execute(
+                "SELECT e.payer_tg_id AS payer,"
+                " p.participant_tg_id AS participant,"
+                " p.share_cents AS share"
+                " FROM expenses e"
+                " JOIN expense_participants p ON p.expense_id = e.id"
+                " WHERE e.group_id=? AND e.deleted=0",
                 (group_id,),
             ).fetchall()
-
-        bal: dict = {}
-
-        for exp in expense_rows:
-            with self._lock:
-                share_rows = self._conn.execute(
-                    "SELECT participant_tg_id, share_cents"
-                    " FROM expense_participants WHERE expense_id=?",
-                    (exp["id"],),
-                ).fetchall()
-            for sr in share_rows:
-                pid, cents = sr["participant_tg_id"], sr["share_cents"]
-                if pid == exp["payer_tg_id"]:
-                    continue
-                key = (pid, exp["payer_tg_id"])
-                bal[key] = bal.get(key, 0) + cents
-
-        with self._lock:
             settlement_rows = self._conn.execute(
                 "SELECT from_tg_id, to_tg_id, amount_cents"
                 " FROM settlements WHERE group_id=? AND confirmed_by_to=1",
                 (group_id,),
             ).fetchall()
 
-        for sr in settlement_rows:
-            frm, to, amt = sr["from_tg_id"], sr["to_tg_id"], sr["amount_cents"]
-            k = (frm, to)
-            cur = bal.get(k, 0)
-            if cur >= amt:
-                bal[k] = cur - amt
-                if bal[k] == 0:
-                    del bal[k]
-            else:
-                over = amt - cur
-                bal.pop(k, None)
-                if over > 0:
-                    inv = (to, frm)
-                    bal[inv] = bal.get(inv, 0) + over
-
-        # Mutual netting
-        for k in list(bal.keys()):
-            if k not in bal:
+        net: dict[int, int] = {}
+        for r in share_rows:
+            payer, participant, share = r["payer"], r["participant"], r["share"]
+            if participant == payer:
                 continue
-            inv = (k[1], k[0])
-            if inv not in bal:
-                continue
-            v1, v2 = bal[k], bal[inv]
-            if v1 >= v2:
-                bal[k] = v1 - v2
-                del bal[inv]
-                if bal[k] == 0:
-                    del bal[k]
-            else:
-                bal[inv] = v2 - v1
-                del bal[k]
+            net[participant] = net.get(participant, 0) - share
+            net[payer] = net.get(payer, 0) + share
 
-        return bal
+        for r in settlement_rows:
+            frm, to, amt = r["from_tg_id"], r["to_tg_id"], r["amount_cents"]
+            net[frm] = net.get(frm, 0) + amt
+            net[to] = net.get(to, 0) - amt
+
+        return {uid: v for uid, v in net.items() if v != 0}
+
+    def compute_group_balances(self, group_id: int) -> dict:
+        """Returns {(from_uid, to_uid): amount_cents} for net unpaid debts.
+
+        Debts are simplified through chains, so A owing B while B owes C
+        collapses into A paying C directly.
+        """
+        return settle_net(self._net_positions(group_id))
 
     def compute_cross_group_net(self, uid: int) -> dict:
+        """Same simplification, but over every group the user belongs to."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT group_id FROM group_members WHERE tg_id=?", (uid,)
             ).fetchall()
         gids = [r["group_id"] for r in rows]
 
-        all_bal: dict = {}
+        net: dict[int, int] = {}
         for gid in gids:
-            for k, v in self.compute_group_balances(gid).items():
-                all_bal[k] = all_bal.get(k, 0) + v
+            for member, v in self._net_positions(gid).items():
+                net[member] = net.get(member, 0) + v
 
-        # Mutual netting (bug fix: also delete zero-value pairs, missing in Go)
-        for k in list(all_bal.keys()):
-            if k not in all_bal:
-                continue
-            inv = (k[1], k[0])
-            if inv not in all_bal:
-                continue
-            v1, v2 = all_bal[k], all_bal[inv]
-            if v1 >= v2:
-                all_bal[k] = v1 - v2
-                del all_bal[inv]
-                if all_bal[k] == 0:
-                    del all_bal[k]
-            else:
-                all_bal[inv] = v2 - v1
-                del all_bal[k]
-
-        return all_bal
+        return settle_net({m: v for m, v in net.items() if v != 0})
 
     # -- settlements --
 
@@ -643,11 +647,15 @@ class Repo:
 # ---------- Keyboards ----------
 
 def main_keyboard() -> ReplyKeyboardMarkup:
+    # Ordered by how often each action is used: adding an expense is the
+    # everyday action and gets a full-width row, creating a group happens
+    # once per trip and sits last.
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("➕ Создать группу"), KeyboardButton("👥 Мои группы")],
-            [KeyboardButton("🔗 Приглашение"), KeyboardButton("🧾 Добавить трату")],
+            [KeyboardButton("🧾 Добавить трату")],
             [KeyboardButton("📊 Балансы"), KeyboardButton("🔄 Взаимозачёт")],
+            [KeyboardButton("👥 Мои группы"), KeyboardButton("🔗 Приглашение")],
+            [KeyboardButton("➕ Создать группу")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -1458,20 +1466,31 @@ class App:
                 lines.append("Вы должны:\n• " + "\n• ".join(you_owe) + "\n")
             if owe_you:
                 lines.append("Вам должны:\n• " + "\n• ".join(owe_you))
+            lines.append(
+                "\n\nДолги сведены в цепочки: если вы должны участнику,"
+                " который должен третьему, платить нужно сразу третьему."
+            )
         text = "".join(lines)
 
+        # Adding an expense is the reason people open a group, so it leads;
+        # the rest is paired up to keep the keyboard short.
         rows = [
-            [InlineKeyboardButton("Поделиться /join…", url=share)],
-            [InlineKeyboardButton("👥 Участники", callback_data=f"members|{gid}|p:0")],
-            [InlineKeyboardButton("Список трат", callback_data=f"explist|{gid}|p:0")],
-            [InlineKeyboardButton("Платежи", callback_data=f"setlist|{gid}|p:0")],
+            [InlineKeyboardButton("🧾 Добавить трату", callback_data=f"aesel|{gid}")],
+            [
+                InlineKeyboardButton("📋 Список трат", callback_data=f"explist|{gid}|p:0"),
+                InlineKeyboardButton("💸 Платежи", callback_data=f"setlist|{gid}|p:0"),
+            ],
+            [
+                InlineKeyboardButton("👥 Участники", callback_data=f"members|{gid}|p:0"),
+                InlineKeyboardButton("🔗 Поделиться /join…", url=share),
+            ],
         ]
         if self.repo.is_group_owner(gid, uid):
             rows.append([InlineKeyboardButton(
                 "🗑 Удалить группу", callback_data=f"grpdel|gid:{gid}"
             )])
         rows.append([InlineKeyboardButton(
-            "Назад к моим группам", callback_data="mg|p:0"
+            "« Мои группы", callback_data="mg|p:0"
         )])
 
         confirm_rows = []

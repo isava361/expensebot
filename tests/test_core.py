@@ -23,6 +23,31 @@ class AmountParserTest(unittest.TestCase):
         self.assertEqual(main.split_amount_and_description("1 20 обед"), ("", ""))
 
 
+class SettleNetTest(unittest.TestCase):
+    def test_chains_debts_through_intermediaries(self):
+        # A owes B 100, B is owed 50 net after paying part of C's bill.
+        result = main.settle_net({1: -150, 2: 50, 3: 100})
+        self.assertEqual(result, {(1, 3): 100, (1, 2): 50})
+
+    def test_pure_chain_removes_the_middleman(self):
+        # A owes B 50 and B owes C 50 -> A pays C directly, B drops out.
+        self.assertEqual(main.settle_net({1: -50, 2: 0, 3: 50}), {(1, 3): 50})
+
+    def test_mutual_debts_cancel(self):
+        self.assertEqual(main.settle_net({}), {})
+        self.assertEqual(main.settle_net({1: 0, 2: 0}), {})
+
+    def test_every_debt_is_covered_exactly(self):
+        net = {1: -700, 2: -300, 3: 250, 4: 750}
+        result = main.settle_net(net)
+        paid: dict = {}
+        for (frm, to), amount in result.items():
+            self.assertGreater(amount, 0)
+            paid[frm] = paid.get(frm, 0) - amount
+            paid[to] = paid.get(to, 0) + amount
+        self.assertEqual(paid, net)
+
+
 class RepoTest(unittest.TestCase):
     def make_repo(self):
         repo = main.Repo(":memory:")
@@ -76,6 +101,45 @@ class RepoTest(unittest.TestCase):
         self.assertEqual(repo.compute_group_balances(gid), {})
         self.assertFalse(repo.add_settlement_if_current(gid, 2, 1, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
+
+    def test_chained_debts_are_simplified_across_the_group(self):
+        repo, gid = self.make_repo()
+        # 2 pays 200 split with 1 -> 1 owes 2 one hundred.
+        repo.create_expense(gid, 2, 2, "ужин", 20000, {1: 10000, 2: 10000})
+        # 3 pays 150 split three ways -> 1 and 2 owe 3 fifty each.
+        repo.create_expense(gid, 3, 3, "такси", 15000, {1: 5000, 2: 5000, 3: 5000})
+
+        # 2 owes nothing: their debt to 3 is carried by 1, who now owes 3 more.
+        self.assertEqual(
+            repo.compute_group_balances(gid),
+            {(1, 3): 10000, (1, 2): 5000},
+        )
+
+    def test_chain_settles_with_a_single_payment(self):
+        repo, gid = self.make_repo()
+        # 1 owes 2, and 2 owes 3 the same amount: 2 should drop out entirely.
+        repo.create_expense(gid, 2, 2, "обед", 1000, {1: 500, 2: 500})
+        repo.create_expense(gid, 3, 3, "кофе", 1000, {2: 500, 3: 500})
+
+        self.assertEqual(repo.compute_group_balances(gid), {(1, 3): 500})
+        self.assertFalse(repo.add_settlement_if_current(gid, 1, 2, 500))
+        self.assertTrue(repo.add_settlement_if_current(gid, 1, 3, 500))
+        self.assertEqual(repo.compute_group_balances(gid), {})
+
+    def test_cross_group_net_chains_between_groups(self):
+        repo, g1 = self.make_repo()
+        _, code2 = repo.create_group("flat", 1)
+        repo.join_by_code(code2, 2)
+        repo.join_by_code(code2, 3)
+        g2 = max(g["id"] for g in repo.list_user_groups(1))
+
+        # 1 owes 2 in the first group, 2 owes 3 in the second one.
+        repo.create_expense(g1, 2, 2, "обед", 1000, {1: 500, 2: 500})
+        repo.create_expense(g2, 3, 3, "кофе", 1000, {2: 500, 3: 500})
+
+        self.assertEqual(repo.compute_group_balances(g1), {(1, 2): 500})
+        self.assertEqual(repo.compute_group_balances(g2), {(2, 3): 500})
+        self.assertEqual(repo.compute_cross_group_net(1), {(1, 3): 500})
 
     def test_settlement_history_and_cancel(self):
         repo, gid = self.make_repo()
