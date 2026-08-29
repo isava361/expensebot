@@ -62,6 +62,12 @@ Important permission rules:
 
 For old databases, migration `002_expense_created_by` backfills `created_by_tg_id` from `payer_tg_id`.
 
+A reply keyboard lives on the Telegram client until the bot sends a new one, so
+`users.keyboard_version` records which layout each user has been shown. Bump
+`KEYBOARD_VERSION` when `main_keyboard()` changes: users holding an older layout
+are sent the new one on their next message, and labels from retired keyboards
+stay routed (`_LEGACY_DEBT_BUTTONS`) so the buttons still on their screen work.
+
 ## Tests
 
 Run unit tests without starting Telegram polling:

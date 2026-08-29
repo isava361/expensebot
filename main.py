@@ -51,6 +51,9 @@ EXPENSES_PER_PAGE = 10
 MEMBERS_PER_PAGE = 15
 SETTLEMENTS_PER_PAGE = 10
 MAX_AMOUNT_CENTS = 1_000_000_000
+# Bump whenever main_keyboard() changes: a reply keyboard lives on the client
+# until the bot sends a new one, so users have to be pushed the new layout.
+KEYBOARD_VERSION = 1
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 
 # ---------- Utils ----------
@@ -284,10 +287,27 @@ class Repo:
 
     def upsert_user(self, tg_id: int, name: str) -> None:
         with self._lock:
+            # New users are stamped with the current keyboard: they are shown
+            # it by /start, so they must not be told it changed.
             self._conn.execute(
-                "INSERT INTO users(tg_id,name) VALUES(?,?)"
+                "INSERT INTO users(tg_id,name,keyboard_version) VALUES(?,?,?)"
                 " ON CONFLICT(tg_id) DO UPDATE SET name=excluded.name",
-                (tg_id, name),
+                (tg_id, name, KEYBOARD_VERSION),
+            )
+            self._conn.commit()
+
+    def has_stale_keyboard(self, uid: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT keyboard_version FROM users WHERE tg_id=?", (uid,)
+            ).fetchone()
+        return row is not None and row["keyboard_version"] < KEYBOARD_VERSION
+
+    def mark_keyboard_current(self, uid: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET keyboard_version=? WHERE tg_id=?",
+                (KEYBOARD_VERSION, uid),
             )
             self._conn.commit()
 
@@ -721,10 +741,14 @@ def _set_new_group(ctx: ContextTypes.DEFAULT_TYPE, v: bool) -> None:
 
 # ---------- App ----------
 
+# Labels from keyboards the bot used to send. Clients keep showing them until
+# they receive a new keyboard, so they have to keep working.
+_LEGACY_DEBT_BUTTONS = {"📊 Балансы", "🔄 Взаимозачёт"}
+
 _TOP_BUTTONS = {
     "➕ Создать группу", "👥 Мои группы", "🔗 Приглашение",
     "🧾 Добавить трату", "💰 Долги",
-}
+} | _LEGACY_DEBT_BUTTONS
 
 
 class App:
@@ -769,6 +793,23 @@ class App:
 
         return InlineKeyboardMarkup(rows), total
 
+    async def _refresh_keyboard(self, update: Update, uid: int) -> None:
+        """Send the current keyboard to a user still holding an older one.
+
+        A reply keyboard only changes when the bot attaches a new one to a
+        message, and the screens below mostly carry inline keyboards, which
+        cannot double as one. So this sends a short message of its own, once
+        per user per layout change.
+        """
+        if not self.repo.has_stale_keyboard(uid):
+            return
+        self.repo.mark_keyboard_current(uid)
+        await update.effective_chat.send_message(
+            "Кнопки внизу обновились: «📊 Балансы» и «🔄 Взаимозачёт»"
+            " объединились в «💰 Долги».",
+            reply_markup=main_keyboard(),
+        )
+
     async def _edit_or_send(
         self,
         update: Update,
@@ -787,6 +828,7 @@ class App:
     async def on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         self.repo.upsert_user(user.id, self._best_name(user))
+        self.repo.mark_keyboard_current(user.id)
 
         raw = (update.effective_message.text or "").strip()
         raw = (
@@ -817,6 +859,7 @@ class App:
         )
 
     async def on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._refresh_keyboard(update, update.effective_user.id)
         if _get_ae(ctx) or _is_new_group(ctx):
             _del_ae(ctx)
             _set_new_group(ctx, False)
@@ -829,6 +872,7 @@ class App:
     async def on_join(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id
         self.repo.upsert_user(uid, self._best_name(update.effective_user))
+        await self._refresh_keyboard(update, uid)
         # PTB strips the /join@botname prefix automatically; ctx.args has the rest
         args = ctx.args or []
         code = ""
@@ -860,6 +904,7 @@ class App:
         txt = (update.effective_message.text or "").strip()
         uid = update.effective_user.id
         self.repo.upsert_user(uid, self._best_name(update.effective_user))
+        await self._refresh_keyboard(update, uid)
 
         # Block top-level buttons while wizard is active
         if (_is_new_group(ctx) or _get_ae(ctx)) and txt in _TOP_BUTTONS:
@@ -992,7 +1037,7 @@ class App:
                 await update.effective_chat.send_message(
                     "Выберите группу для добавления траты:", reply_markup=markup
                 )
-        elif txt == "💰 Долги":
+        elif txt == "💰 Долги" or txt in _LEGACY_DEBT_BUTTONS:
             await self._show_debts(update, ctx)
 
     # ---------- Add-expense wizard (text steps) ----------
@@ -1126,6 +1171,7 @@ class App:
         query = update.callback_query
         data = query.data
         uid = update.effective_user.id
+        await self._refresh_keyboard(update, uid)
 
         if data == "cancel_flow":
             _del_ae(ctx)
