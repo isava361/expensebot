@@ -1,9 +1,30 @@
+import asyncio
 import sqlite3
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 import main
+
+
+class FakeChat:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, text, reply_markup=None, **kwargs):
+        self.sent.append((text, reply_markup))
+
+
+class FakeUpdate:
+    callback_query = None
+
+    def __init__(self, uid, text):
+        self.effective_user = types.SimpleNamespace(
+            id=uid, username=f"u{uid}", first_name="U", last_name=None
+        )
+        self.effective_chat = FakeChat()
+        self.effective_message = types.SimpleNamespace(text=text)
 
 
 class AmountParserTest(unittest.TestCase):
@@ -200,6 +221,85 @@ class RepoTest(unittest.TestCase):
         repo.delete_settlement(settlement_id, gid)
         self.assertEqual(repo.count_group_settlements(gid), 0)
         self.assertEqual(repo.compute_group_balances(gid), {(2, 1): 500})
+
+
+class KeyboardTest(unittest.TestCase):
+    def labels(self):
+        return [b.text for row in main.main_keyboard().keyboard for b in row]
+
+    def send(self, app, uid, text):
+        update = FakeUpdate(uid, text)
+        ctx = types.SimpleNamespace(user_data={}, bot=None)
+        asyncio.run(app.on_text(update, ctx))
+        return update.effective_chat.sent
+
+    def test_every_keyboard_button_gets_a_reply(self):
+        """A button the router forgot about leaves the bot silent, which is
+        how the old «Балансы»/«Взаимозачёт» buttons broke."""
+        repo = main.Repo(":memory:")
+        app = main.App(repo, "bot")
+        for label in self.labels():
+            with self.subTest(label=label):
+                self.assertTrue(self.send(app, 1, label), f"{label} got no reply")
+
+    def test_keyboard_buttons_are_blocked_during_a_wizard(self):
+        for label in self.labels():
+            self.assertIn(label, main._TOP_BUTTONS)
+
+    def test_legacy_buttons_still_open_the_debts_screen(self):
+        """Old clients keep showing the previous keyboard until the bot sends
+        a new one, so its labels have to keep working."""
+        repo = main.Repo(":memory:")
+        repo.upsert_user(1, "@me")
+        repo.create_group("trip", 1)
+        app = main.App(repo, "bot")
+        for label in main._LEGACY_DEBT_BUTTONS:
+            with self.subTest(label=label):
+                self.assertNotIn(label, self.labels())
+                self.assertIn(label, main._TOP_BUTTONS)
+                sent = self.send(app, 1, label)
+                self.assertTrue(any("Долги" in t for t, _ in sent), sent)
+
+    def test_stale_keyboard_is_pushed_once(self):
+        repo = main.Repo(":memory:")
+        app = main.App(repo, "bot")
+        repo.upsert_user(1, "@me")
+        repo._conn.execute("UPDATE users SET keyboard_version=0 WHERE tg_id=1")
+        repo._conn.commit()
+        self.assertTrue(repo.has_stale_keyboard(1))
+
+        sent = self.send(app, 1, "📊 Балансы")
+        notice, markup = sent[0]
+        self.assertIn("обновились", notice)
+        self.assertEqual(
+            [[b.text for b in row] for row in markup.keyboard],
+            [[b.text for b in row] for row in main.main_keyboard().keyboard],
+        )
+        self.assertFalse(repo.has_stale_keyboard(1))
+
+        # The notice is not repeated on the next message.
+        again = self.send(app, 1, "💰 Долги")
+        self.assertFalse(any("обновились" in t for t, _ in again), again)
+
+    def test_new_users_are_not_told_the_keyboard_changed(self):
+        repo = main.Repo(":memory:")
+        repo.upsert_user(7, "@new")
+        self.assertFalse(repo.has_stale_keyboard(7))
+
+    def test_old_database_gets_the_keyboard_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "old.db"
+            schema = (main.MIGRATIONS_DIR / "001_init.sql").read_text(encoding="utf-8")
+            conn = sqlite3.connect(db_path)
+            conn.executescript(schema)
+            conn.execute("INSERT INTO users(tg_id,name) VALUES(1,'owner')")
+            conn.commit()
+            conn.close()
+
+            repo = main.Repo(str(db_path))
+            self.assertTrue(repo._column_exists("users", "keyboard_version"))
+            self.assertTrue(repo.has_stale_keyboard(1))
+            repo.close()
 
 
 if __name__ == "__main__":
