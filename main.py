@@ -9,6 +9,7 @@ ENV:
   DB_PATH=./data.db
 """
 
+import asyncio
 import base64
 import html
 import logging
@@ -39,6 +40,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PicklePersistence,
     filters,
 )
 
@@ -53,10 +55,16 @@ EXPENSES_PER_PAGE = 10
 MEMBERS_PER_PAGE = 15
 SETTLEMENTS_PER_PAGE = 10
 MAX_AMOUNT_CENTS = 1_000_000_000
+# Telegram rejects anything longer; leave room for the ellipsis marker.
+MESSAGE_LIMIT = 3900
 # Bump whenever main_keyboard() changes: a reply keyboard lives on the client
 # until the bot sends a new one, so users have to be pushed the new layout.
 KEYBOARD_VERSION = 1
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+# Base currency a new group starts with; changeable while the group is empty.
+DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", "RUB").strip().upper()
+# Offset new users start with, e.g. "+03:00". Everyone can change it with /tz.
+DEFAULT_TZ_OFFSET = os.environ.get("DEFAULT_TZ_OFFSET", "0")
 
 # ---------- Utils ----------
 
@@ -116,6 +124,28 @@ def cents_from_str(s: str) -> int:
     return value
 
 
+def split_amount_currency_desc(text: str) -> tuple[str, str, str]:
+    """Split "1500 EUR ужин" into amount, currency and description.
+
+    The currency is optional and may be glued to the number ("1500€") or
+    stand as a code after it. An unrecognised word stays in the description,
+    so nothing a person types is silently read as money in another currency.
+    """
+    prepared = text.strip()
+    for symbol in _CURRENCY_SYMBOLS:
+        if symbol in prepared:
+            prepared = prepared.replace(symbol, f" {symbol} ")
+    amount, rest = split_amount_and_description(" ".join(prepared.split()))
+    if not amount:
+        return "", "", ""
+
+    head, _, tail = rest.partition(" ")
+    currency = normalize_currency(head) if head else ""
+    if currency:
+        return amount, currency, tail.strip()
+    return amount, "", rest
+
+
 def split_amount_and_description(text: str) -> tuple[str, str]:
     match = _AMOUNT_WITH_DESC_RE.match(text)
     if not match:
@@ -135,16 +165,117 @@ def split_amount_and_description(text: str) -> tuple[str, str]:
     return amount, desc
 
 
-def format_cents(c: int) -> str:
+# Codes the bot recognises after an amount. A closed list on purpose: a
+# three-letter word after a number is far more often part of the description
+# ("1500 gas") than a currency, and guessing wrong changes what people owe.
+KNOWN_CURRENCIES = {
+    "AED", "AMD", "AUD", "AZN", "BGN", "BRL", "BYN", "CAD", "CHF", "CNY",
+    "CZK", "DKK", "EGP", "EUR", "GBP", "GEL", "HKD", "HUF", "IDR", "ILS",
+    "INR", "JPY", "KGS", "KRW", "KZT", "MAD", "MDL", "MXN", "MYR", "NOK",
+    "NZD", "PHP", "PLN", "RON", "RSD", "RUB", "SEK", "SGD", "THB", "TRY",
+    "UAH", "USD", "UZS", "VND", "ZAR",
+}
+
+_CURRENCY_SYMBOLS = {
+    "€": "EUR", "$": "USD", "₽": "RUB", "£": "GBP", "₺": "TRY", "¥": "JPY",
+    "₾": "GEL", "₸": "KZT", "֏": "AMD", "₴": "UAH", "₪": "ILS", "₹": "INR",
+    "₩": "KRW", "﷼": "AED", "฿": "THB", "₫": "VND", "zł": "PLN",
+}
+
+
+def normalize_currency(token: str) -> str:
+    """Return the currency a token names, or "" if it names none."""
+    cleaned = token.strip()
+    if cleaned in _CURRENCY_SYMBOLS:
+        return _CURRENCY_SYMBOLS[cleaned]
+    upper = cleaned.upper()
+    return upper if upper in KNOWN_CURRENCIES else ""
+
+
+def format_cents(c: int, currency: str = "") -> str:
     sign = ""
     if c < 0:
         sign = "-"
         c = -c
-    return f"{sign}{c // 100}.{c % 100:02d}"
+    amount = f"{sign}{c // 100}.{c % 100:02d}"
+    return f"{amount} {currency}" if currency else amount
 
 
-def format_time(ts: int) -> str:
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+def format_rate(base_cents: int, orig_cents: int, base: str, orig: str) -> str:
+    """How much base currency one unit of the paid currency cost."""
+    if orig_cents <= 0:
+        return ""
+    return f"1 {orig} = {base_cents / orig_cents:.4f} {base}"
+
+
+# A trip crosses time zones, so a timestamp only means something next to
+# the offset it was rendered in. Telegram never tells us a user's zone, so
+# people set their own and everyone else falls back to this default.
+MAX_TZ_OFFSET_MIN = 14 * 60
+_TZ_RE = re.compile(r"^(?P<sign>[+-])?(?P<hours>\d{1,2})(?::?(?P<minutes>\d{2}))?$")
+
+
+def parse_tz_offset(text: str) -> int:
+    """Read "+3", "-05:30", "0300" or "UTC+3" as minutes from UTC."""
+    cleaned = text.strip().upper().replace("UTC", "").replace("GMT", "").strip()
+    cleaned = cleaned.replace(" ", "")
+    if not cleaned:
+        raise ValueError("empty offset")
+    m = _TZ_RE.match(cleaned)
+    if not m:
+        raise ValueError(f"bad offset: {text!r}")
+    minutes = int(m.group("hours")) * 60 + int(m.group("minutes") or 0)
+    if m.group("sign") == "-":
+        minutes = -minutes
+    if abs(minutes) > MAX_TZ_OFFSET_MIN:
+        raise ValueError(f"offset out of range: {text!r}")
+    return minutes
+
+
+def tz_label(offset_min: int) -> str:
+    sign = "-" if offset_min < 0 else "+"
+    hours, minutes = divmod(abs(offset_min), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def default_tz_offset_min() -> int:
+    try:
+        return parse_tz_offset(DEFAULT_TZ_OFFSET)
+    except ValueError:
+        logger.warning("bad DEFAULT_TZ_OFFSET %r, using UTC", DEFAULT_TZ_OFFSET)
+        return 0
+
+
+def format_time(ts: int, offset_min: int = 0) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts + offset_min * 60))
+
+
+def split_message(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Cut a screen into Telegram-sized pieces on line boundaries.
+
+    The debts screen grows with every group a person is in, and a message
+    over the limit is not truncated by Telegram — it is refused, so the
+    screen would simply never arrive.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:  # one absurdly long line, split it hard
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def rand_code() -> str:
@@ -272,6 +403,8 @@ def _cell_text(value) -> str:
         return ""
     if isinstance(value, Money):
         return format_cents(value.cents)
+    if isinstance(value, float):
+        return f"{value:g}"
     return str(value)
 
 
@@ -282,6 +415,8 @@ def _cell_xml(ref: str, value, style: int) -> str:
         return f'<c r="{ref}" s="{_XLSX_MONEY_STYLE}"><v>{format_cents(value.cents)}</v></c>'
     if isinstance(value, int) and not isinstance(value, bool):
         return f'<c r="{ref}" s="{style}"><v>{value}</v></c>'
+    if isinstance(value, float):
+        return f'<c r="{ref}" s="{style}"><v>{value:.6f}</v></c>'
     return (
         f'<c r="{ref}" t="inlineStr" s="{style}">'
         f'<is><t xml:space="preserve">{_xml_text(str(value))}</t></is></c>'
@@ -506,9 +641,10 @@ class Repo:
             # New users are stamped with the current keyboard: they are shown
             # it by /start, so they must not be told it changed.
             self._conn.execute(
-                "INSERT INTO users(tg_id,name,keyboard_version) VALUES(?,?,?)"
+                "INSERT INTO users(tg_id,name,keyboard_version,tz_offset_min)"
+                " VALUES(?,?,?,?)"
                 " ON CONFLICT(tg_id) DO UPDATE SET name=excluded.name",
-                (tg_id, name, KEYBOARD_VERSION),
+                (tg_id, name, KEYBOARD_VERSION, default_tz_offset_min()),
             )
             self._conn.commit()
 
@@ -527,6 +663,34 @@ class Repo:
             )
             self._conn.commit()
 
+    def names_for(self, ids) -> dict[int, str]:
+        """Names for a whole screen in one query instead of one per row."""
+        wanted = list({int(i) for i in ids})
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" * len(wanted))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT tg_id, name FROM users WHERE tg_id IN ({placeholders})",
+                wanted,
+            ).fetchall()
+        found = {r["tg_id"]: r["name"] for r in rows}
+        return {uid: found.get(uid, str(uid)) for uid in wanted}
+
+    def user_tz(self, uid: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT tz_offset_min FROM users WHERE tg_id=?", (uid,)
+            ).fetchone()
+        return row["tz_offset_min"] if row else default_tz_offset_min()
+
+    def set_user_tz(self, uid: int, offset_min: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET tz_offset_min=? WHERE tg_id=?", (offset_min, uid)
+            )
+            self._conn.commit()
+
     def user_name(self, uid: int) -> str:
         with self._lock:
             row = self._conn.execute(
@@ -536,18 +700,20 @@ class Repo:
 
     # -- groups --
 
-    def create_group(self, title: str, owner: int) -> tuple[int, str]:
+    def create_group(self, title: str, owner: int, currency: str = "") -> tuple[int, str]:
         code = rand_code()
+        currency = normalize_currency(currency) or DEFAULT_CURRENCY
         with self._lock:
             cur = self._conn.execute(
-                'INSERT INTO "groups"(title,owner_tg_id,invite_code,created_at)'
-                " VALUES(?,?,?,?)",
-                (title, owner, code, now_unix()),
+                'INSERT INTO "groups"(title,owner_tg_id,invite_code,created_at,currency)'
+                " VALUES(?,?,?,?,?)",
+                (title, owner, code, now_unix(), currency),
             )
             gid = cur.lastrowid
             self._conn.execute(
-                "INSERT INTO group_members(group_id,tg_id,role) VALUES(?,?,?)",
-                (gid, owner, "owner"),
+                "INSERT INTO group_members(group_id,tg_id,role,joined_at)"
+                " VALUES(?,?,?,?)",
+                (gid, owner, "owner", now_unix()),
             )
             self._conn.commit()
         return gid, code
@@ -561,9 +727,10 @@ class Repo:
                 raise ValueError("invalid invite code")
             gid, title = row["id"], row["title"]
             self._conn.execute(
-                "INSERT INTO group_members(group_id,tg_id,role) VALUES(?,?,?)"
+                "INSERT INTO group_members(group_id,tg_id,role,joined_at)"
+                " VALUES(?,?,?,?)"
                 " ON CONFLICT(group_id,tg_id) DO NOTHING",
-                (gid, uid, "member"),
+                (gid, uid, "member", now_unix()),
             )
             self._conn.commit()
         return gid, title
@@ -611,6 +778,52 @@ class Repo:
             ).fetchone()
         return row["title"] if row else ""
 
+    def group_currency(self, group_id: int) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT currency FROM "groups" WHERE id=?', (group_id,)
+            ).fetchone()
+        return row["currency"] if row else DEFAULT_CURRENCY
+
+    def group_currencies(self, group_ids) -> dict[int, str]:
+        """One lookup for a screen that spans groups."""
+        ids = list(group_ids)
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            rows = self._conn.execute(
+                f'SELECT id, currency FROM "groups" WHERE id IN ({placeholders})',
+                ids,
+            ).fetchall()
+        return {r["id"]: r["currency"] for r in rows}
+
+    def can_change_currency(self, group_id: int) -> bool:
+        """Only while the group is empty.
+
+        Every stored amount is already in the base currency; swapping it
+        later would silently reinterpret every past trace.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT"
+                " (SELECT COUNT(*) FROM expenses WHERE group_id=? AND deleted=0)"
+                " + (SELECT COUNT(*) FROM settlements WHERE group_id=?)",
+                (group_id, group_id),
+            ).fetchone()
+        return bool(row) and row[0] == 0
+
+    def set_group_currency(self, group_id: int, currency: str) -> bool:
+        code = normalize_currency(currency)
+        if not code or not self.can_change_currency(group_id):
+            return False
+        with self._lock:
+            self._conn.execute(
+                'UPDATE "groups" SET currency=? WHERE id=?', (code, group_id)
+            )
+            self._conn.commit()
+        return True
+
     def is_group_owner(self, group_id: int, uid: int) -> bool:
         with self._lock:
             row = self._conn.execute(
@@ -620,6 +833,102 @@ class Repo:
 
     def can_delete_group(self, group_id: int, uid: int) -> bool:
         return self.is_group_owner(group_id, uid)
+
+    def rename_group(self, group_id: int, title: str) -> bool:
+        clean = title.strip()
+        if not clean:
+            return False
+        with self._lock:
+            self._conn.execute(
+                'UPDATE "groups" SET title=? WHERE id=?', (clean[:100], group_id)
+            )
+            self._conn.commit()
+        return True
+
+    def member_balance(self, group_id: int, uid: int) -> int:
+        """What this person is up or down in one group, in its currency."""
+        return self._net_positions(group_id).get(uid, 0)
+
+    def remove_member(self, group_id: int, uid: int) -> str:
+        """Take someone out of a group. Returns "" or why it cannot happen.
+
+        Somebody who is still owed money — or still owes it — cannot be
+        dropped: their share of every past expense stays in the ledger, but
+        the debt screen only walks the groups a person belongs to, so the
+        debt would keep existing for the other side alone.
+        """
+        if not self.is_group_member(group_id, uid):
+            return "not_member"
+        if self.member_balance(group_id, uid) != 0:
+            return "has_debt"
+        if self.is_group_owner(group_id, uid):
+            return "owner"
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM group_members WHERE group_id=? AND tg_id=?",
+                (group_id, uid),
+            )
+            self._conn.commit()
+        return ""
+
+    def leave_group(self, group_id: int, uid: int) -> str:
+        """Leave a group, handing ownership over if the owner walks out.
+
+        Returns "" on success, "last" if the group was removed with its
+        last member, or the reason it could not happen.
+        """
+        if not self.is_group_member(group_id, uid):
+            return "not_member"
+        if self.member_balance(group_id, uid) != 0:
+            return "has_debt"
+
+        if not self.is_group_owner(group_id, uid):
+            with self._lock:
+                self._conn.execute(
+                    "DELETE FROM group_members WHERE group_id=? AND tg_id=?",
+                    (group_id, uid),
+                )
+                self._conn.commit()
+            return ""
+
+        with self._lock:
+            heir = self._conn.execute(
+                "SELECT tg_id FROM group_members"
+                " WHERE group_id=? AND tg_id<>?"
+                " ORDER BY joined_at, tg_id LIMIT 1",
+                (group_id, uid),
+            ).fetchone()
+        if heir is None:
+            # Nobody is left to own it, so the group goes with them.
+            self.delete_group(group_id)
+            return "last"
+
+        with self._lock:
+            self._conn.execute(
+                'UPDATE "groups" SET owner_tg_id=? WHERE id=?',
+                (heir["tg_id"], group_id),
+            )
+            self._conn.execute(
+                "UPDATE group_members SET role='owner' WHERE group_id=? AND tg_id=?",
+                (group_id, heir["tg_id"]),
+            )
+            self._conn.execute(
+                "DELETE FROM group_members WHERE group_id=? AND tg_id=?",
+                (group_id, uid),
+            )
+            self._conn.commit()
+        return ""
+
+    def next_owner(self, group_id: int, leaving: int) -> int:
+        """Who would inherit the group — for warning the leaver in advance."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT tg_id FROM group_members"
+                " WHERE group_id=? AND tg_id<>?"
+                " ORDER BY joined_at, tg_id LIMIT 1",
+                (group_id, leaving),
+            ).fetchone()
+        return row["tg_id"] if row else 0
 
     def delete_group(self, group_id: int) -> None:
         with self._lock:
@@ -661,6 +970,8 @@ class Repo:
         description: str,
         amount_cents: int,
         shares: dict,
+        orig_currency: str = "",
+        orig_amount_cents: int = 0,
     ) -> int:
         if not shares:
             raise ValueError("no participants")
@@ -679,9 +990,13 @@ class Repo:
 
             cur = self._conn.execute(
                 "INSERT INTO expenses("
-                "group_id,created_by_tg_id,payer_tg_id,description,amount_cents,created_at"
-                ") VALUES(?,?,?,?,?,?)",
-                (group_id, created_by, payer, description, amount_cents, now_unix()),
+                "group_id,created_by_tg_id,payer_tg_id,description,amount_cents,"
+                "created_at,orig_currency,orig_amount_cents"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    group_id, created_by, payer, description, amount_cents,
+                    now_unix(), orig_currency or None, orig_amount_cents or None,
+                ),
             )
             expense_id = cur.lastrowid
             self._conn.executemany(
@@ -692,12 +1007,94 @@ class Repo:
             self._conn.commit()
         return expense_id
 
+    def get_expense(self, expense_id: int, group_id: int) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, group_id, payer_tg_id, created_by_tg_id, description,"
+                " amount_cents, created_at, updated_at, orig_currency,"
+                " orig_amount_cents, receipt_file_id"
+                " FROM expenses WHERE id=? AND group_id=? AND deleted=0",
+                (expense_id, group_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "group_id": row["group_id"],
+            "payer": row["payer_tg_id"],
+            "created_by": row["created_by_tg_id"],
+            "desc": row["description"],
+            "amount_cents": row["amount_cents"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"] or 0,
+            "orig_currency": row["orig_currency"] or "",
+            "orig_amount_cents": row["orig_amount_cents"] or 0,
+            "receipt": row["receipt_file_id"] or "",
+            "shares": self.get_expense_shares(expense_id),
+        }
+
+    def update_expense(
+        self,
+        expense_id: int,
+        group_id: int,
+        payer: int,
+        description: str,
+        amount_cents: int,
+        shares: dict,
+        orig_currency: str = "",
+        orig_amount_cents: int = 0,
+    ) -> None:
+        """Rewrite an expense in place, keeping its number and its receipt."""
+        if not shares:
+            raise ValueError("no participants")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tg_id FROM group_members WHERE group_id=?", (group_id,)
+            ).fetchall()
+            members = {r["tg_id"] for r in rows}
+            if payer not in members:
+                raise ValueError("payer is not a group member")
+            if not set(shares).issubset(members):
+                raise ValueError("expense participant is not a group member")
+
+            self._conn.execute(
+                "UPDATE expenses SET payer_tg_id=?, description=?, amount_cents=?,"
+                " orig_currency=?, orig_amount_cents=?, updated_at=?"
+                " WHERE id=? AND group_id=? AND deleted=0",
+                (
+                    payer, description, amount_cents,
+                    orig_currency or None, orig_amount_cents or None,
+                    now_unix(), expense_id, group_id,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM expense_participants WHERE expense_id=?", (expense_id,)
+            )
+            self._conn.executemany(
+                "INSERT INTO expense_participants(expense_id,participant_tg_id,share_cents)"
+                " VALUES(?,?,?)",
+                [(expense_id, pid, cents) for pid, cents in shares.items()],
+            )
+            self._conn.commit()
+
+    def set_receipt(self, expense_id: int, group_id: int, file_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE expenses SET receipt_file_id=? WHERE id=? AND group_id=?",
+                (file_id or None, expense_id, group_id),
+            )
+            self._conn.commit()
+
     def delete_expense(self, expense_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE expenses SET deleted=1 WHERE id=?", (expense_id,)
             )
             self._conn.commit()
+
+    def can_edit_expense(self, expense_id: int, group_id: int, uid: int) -> bool:
+        """Same rule as deleting: the person who entered it owns it."""
+        return self.can_delete_expense(expense_id, group_id, uid)
 
     def can_delete_expense(self, expense_id: int, group_id: int, uid: int) -> bool:
         with self._lock:
@@ -725,7 +1122,9 @@ class Repo:
     def list_group_expenses(self, group_id: int, limit: int, offset: int) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id,payer_tg_id,created_by_tg_id,amount_cents,description,created_at"
+                "SELECT id,payer_tg_id,created_by_tg_id,amount_cents,description,"
+                "created_at,updated_at,orig_currency,orig_amount_cents,"
+                "receipt_file_id"
                 " FROM expenses WHERE group_id=? AND deleted=0"
                 " ORDER BY id DESC LIMIT ? OFFSET ?",
                 (group_id, limit, offset),
@@ -738,6 +1137,10 @@ class Repo:
                 "amount_cents": r["amount_cents"],
                 "desc": r["description"],
                 "created_at": r["created_at"],
+                "updated_at": r["updated_at"] or 0,
+                "orig_currency": r["orig_currency"] or "",
+                "orig_amount_cents": r["orig_amount_cents"] or 0,
+                "receipt": r["receipt_file_id"] or "",
             }
             for r in rows
         ]
@@ -793,26 +1196,34 @@ class Repo:
         """
         return settle_net(self._net_positions(group_id))
 
-    def compute_user_debts(self, uid: int) -> dict[int, dict]:
+    def compute_user_debts(self, uid: int) -> dict[int, dict[str, dict]]:
         """What ``uid`` owes and is owed, per counterparty, across groups.
 
-        Returns ``{other_uid: {"net": cents, "by_group": {gid: cents}}}``
+        Returns ``{other_uid: {currency: {"net": cents, "by_group": {gid: cents}}}}``
         where a positive amount means the counterparty owes ``uid`` and a
         negative one means ``uid`` owes them. Debts in opposite directions
         cancel: owing someone 50 in one group while they owe 50 in another
         nets to zero, and there is genuinely nothing to transfer.
+
+        Currencies are kept apart, because a debt in lira is not repaid by
+        a credit in roubles — netting them would invent an exchange rate
+        nobody agreed on.
 
         Only pairs that share a group can appear here, because every entry
         comes from a single group's simplified balances.
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT group_id FROM group_members WHERE tg_id=?", (uid,)
+                "SELECT m.group_id AS gid, g.currency AS currency"
+                " FROM group_members m"
+                ' JOIN "groups" g ON g.id = m.group_id'
+                " WHERE m.tg_id=?",
+                (uid,),
             ).fetchall()
 
-        result: dict[int, dict] = {}
+        result: dict[int, dict[str, dict]] = {}
         for r in rows:
-            gid = r["group_id"]
+            gid, currency = r["gid"], r["currency"]
             for (frm, to), amount in self.compute_group_balances(gid).items():
                 if frm == uid:
                     other, delta = to, -amount
@@ -820,7 +1231,9 @@ class Repo:
                     other, delta = frm, amount
                 else:
                     continue
-                entry = result.setdefault(other, {"net": 0, "by_group": {}})
+                entry = result.setdefault(other, {}).setdefault(
+                    currency, {"net": 0, "by_group": {}}
+                )
                 entry["net"] += delta
                 entry["by_group"][gid] = entry["by_group"].get(gid, 0) + delta
 
@@ -828,41 +1241,165 @@ class Repo:
 
     # -- settlements --
 
-    def settle_with_user(self, uid: int, other: int, amount_cents: int) -> bool:
-        """Close every debt between ``uid`` and ``other`` in one go.
+    def request_settlement(
+        self, uid: int, other: int, currency: str, amount_cents: int
+    ) -> str:
+        """Record a payment ``uid`` says they made, awaiting confirmation.
 
-        ``amount_cents`` is the net that ``uid`` hands over; it must still
-        match the live net, so a stale button does nothing. Debts are
-        closed in every shared group and in both directions, so the two
-        halves of a cross-group offset disappear together instead of one
-        being paid twice. A net of zero is allowed and settles nothing but
-        the bookkeeping: the debts cancelled out, so no money moves.
+        Returns the batch id, or "" if the request does not match the live
+        debt. Nothing here changes any balance: the rows land unconfirmed,
+        and only the person who was supposed to receive the money can turn
+        them into a settled debt.
+
+        Paying the whole net closes the debt in every shared group and in
+        both directions, so the two halves of a cross-group offset
+        disappear together instead of one being paid twice. A smaller
+        amount is spread over the groups where ``uid`` owes, largest debt
+        first, and leaves the rest standing — the export shows exactly
+        which group each part went to.
         """
+        currency = normalize_currency(currency)
+        if amount_cents < 0 or not currency:
+            return ""
+
         with self._lock:
-            entry = self.compute_user_debts(uid).get(other)
+            if self.pending_batch_between(uid, other, currency):
+                return ""  # one open claim at a time, or people double-pay
+            entry = self.compute_user_debts(uid).get(other, {}).get(currency)
             if entry is None:
-                return False
-            if amount_cents < 0 or amount_cents != -entry["net"]:
-                return False
+                return ""
+            owed = -entry["net"]
+            if amount_cents > owed:
+                return ""
 
             rows = []
-            for gid, delta in entry["by_group"].items():
-                if delta < 0:
-                    rows.append((gid, uid, other, -delta))
-                elif delta > 0:
-                    rows.append((gid, other, uid, delta))
+            if amount_cents == owed:
+                for gid, delta in entry["by_group"].items():
+                    if delta < 0:
+                        rows.append((gid, uid, other, -delta))
+                    elif delta > 0:
+                        rows.append((gid, other, uid, delta))
+            else:
+                left = amount_cents
+                debts = sorted(
+                    ((gid, -delta) for gid, delta in entry["by_group"].items() if delta < 0),
+                    key=lambda pair: (-pair[1], pair[0]),
+                )
+                for gid, debt in debts:
+                    if left <= 0:
+                        break
+                    part = min(left, debt)
+                    rows.append((gid, uid, other, part))
+                    left -= part
+                if left > 0:
+                    return ""
             if not rows:
-                return False
+                return ""
 
+            batch = rand_code()
             ts = now_unix()
             self._conn.executemany(
                 "INSERT INTO settlements"
-                "(group_id,from_tg_id,to_tg_id,amount_cents,confirmed_by_to,created_at)"
-                " VALUES(?,?,?,?,1,?)",
-                [(gid, frm, to, amt, ts) for gid, frm, to, amt in rows],
+                "(group_id,from_tg_id,to_tg_id,amount_cents,confirmed_by_to,"
+                "created_at,batch)"
+                " VALUES(?,?,?,?,0,?,?)",
+                [(gid, frm, to, amt, ts, batch) for gid, frm, to, amt in rows],
             )
             self._conn.commit()
-            return True
+            return batch
+
+    def pending_batch_between(self, uid: int, other: int, currency: str) -> str:
+        """The open claim between two people in one currency, if any."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.batch, g.currency"
+                " FROM settlements s"
+                ' JOIN "groups" g ON g.id = s.group_id'
+                " WHERE s.confirmed_by_to=0 AND s.batch IS NOT NULL"
+                " AND ((s.from_tg_id=? AND s.to_tg_id=?)"
+                "      OR (s.from_tg_id=? AND s.to_tg_id=?))",
+                (uid, other, other, uid),
+            ).fetchall()
+        for r in rows:
+            if r["currency"] == currency:
+                return r["batch"]
+        return ""
+
+    def batch_info(self, batch: str) -> Optional[dict]:
+        """Who owes whom, how much, and in which groups — for one claim."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.group_id, s.from_tg_id, s.to_tg_id, s.amount_cents,"
+                " s.confirmed_by_to, s.created_at, g.currency"
+                " FROM settlements s"
+                ' JOIN "groups" g ON g.id = s.group_id'
+                " WHERE s.batch=?",
+                (batch,),
+            ).fetchall()
+        if not rows:
+            return None
+        # The payer is the side that hands money over; a full settlement can
+        # also carry the opposite half of a cross-group offset, which is
+        # bookkeeping rather than a transfer.
+        paid = {}
+        for r in rows:
+            key = (r["from_tg_id"], r["to_tg_id"])
+            paid[key] = paid.get(key, 0) + r["amount_cents"]
+        (frm, to), amount = max(paid.items(), key=lambda kv: kv[1])
+        return {
+            "batch": batch,
+            "from": frm,
+            "to": to,
+            "amount_cents": amount,
+            "currency": rows[0]["currency"],
+            "confirmed": bool(rows[0]["confirmed_by_to"]),
+            "created_at": rows[0]["created_at"],
+            "groups": sorted({r["group_id"] for r in rows}),
+        }
+
+    def confirm_settlement(self, batch: str, uid: int) -> bool:
+        """Only the person the money was owed to can confirm it arrived."""
+        info = self.batch_info(batch)
+        if info is None or info["confirmed"] or info["to"] != uid:
+            return False
+        with self._lock:
+            self._conn.execute(
+                "UPDATE settlements SET confirmed_by_to=1"
+                " WHERE batch=? AND confirmed_by_to=0",
+                (batch,),
+            )
+            self._conn.commit()
+        return True
+
+    def reject_settlement(self, batch: str, uid: int) -> bool:
+        """Drop an unconfirmed claim.
+
+        The recipient rejects a payment they never got; the payer withdraws
+        a claim they sent by mistake. Either way the debt simply stays.
+        """
+        info = self.batch_info(batch)
+        if info is None or info["confirmed"] or uid not in (info["from"], info["to"]):
+            return False
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM settlements WHERE batch=? AND confirmed_by_to=0",
+                (batch,),
+            )
+            self._conn.commit()
+        return True
+
+    def list_pending_settlements(self, uid: int) -> list[dict]:
+        """Open claims this person sent or has to answer, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT batch FROM settlements"
+                " WHERE confirmed_by_to=0 AND batch IS NOT NULL"
+                " AND (from_tg_id=? OR to_tg_id=?)"
+                " ORDER BY created_at DESC",
+                (uid, uid),
+            ).fetchall()
+        infos = [self.batch_info(r["batch"]) for r in rows]
+        return [i for i in infos if i is not None]
 
     def count_group_settlements(self, group_id: int) -> int:
         with self._lock:
@@ -875,7 +1412,8 @@ class Repo:
     def list_group_settlements(self, group_id: int, limit: int, offset: int) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, from_tg_id, to_tg_id, amount_cents, created_at"
+                "SELECT id, from_tg_id, to_tg_id, amount_cents, created_at,"
+                " confirmed_by_to, batch"
                 " FROM settlements WHERE group_id=?"
                 " ORDER BY id DESC LIMIT ? OFFSET ?",
                 (group_id, limit, offset),
@@ -887,6 +1425,8 @@ class Repo:
                 "to": r["to_tg_id"],
                 "amount_cents": r["amount_cents"],
                 "created_at": r["created_at"],
+                "confirmed": bool(r["confirmed_by_to"]),
+                "batch": r["batch"] or "",
             }
             for r in rows
         ]
@@ -920,7 +1460,8 @@ class Repo:
         with self._lock:
             expense_rows = self._conn.execute(
                 "SELECT id, payer_tg_id, created_by_tg_id, description,"
-                " amount_cents, created_at"
+                " amount_cents, created_at, updated_at, orig_currency,"
+                " orig_amount_cents, receipt_file_id"
                 " FROM expenses WHERE group_id=? AND deleted=0"
                 " ORDER BY created_at, id",
                 (group_id,),
@@ -951,6 +1492,10 @@ class Repo:
                 "desc": r["description"],
                 "amount_cents": r["amount_cents"],
                 "created_at": r["created_at"],
+                "updated_at": r["updated_at"] or 0,
+                "orig_currency": r["orig_currency"] or "",
+                "orig_amount_cents": r["orig_amount_cents"] or 0,
+                "receipt": r["receipt_file_id"] or "",
                 "shares": shares.get(r["id"], {}),
             }
             for r in expense_rows
@@ -981,6 +1526,7 @@ class Repo:
         return {
             "group_id": group_id,
             "title": self.get_group_title(group_id),
+            "currency": self.group_currency(group_id),
             "members": members,
             "names": names,
             "expenses": expenses,
@@ -1004,7 +1550,7 @@ def export_filename(group_id: int, title: str) -> str:
     return "-".join(p for p in parts if p) + ".xlsx"
 
 
-def _expenses_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]]:
+def _expenses_sheet(data: dict, order: list[int], tz: int) -> tuple[str, list, list[list]]:
     """One row per expense, one share column per person.
 
     Reading across a row shows who paid and how the amount was cut up;
@@ -1012,9 +1558,11 @@ def _expenses_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]
     totals at the bottom are what the balances sheet starts from.
     """
     names = data["names"]
+    base = data["currency"]
     header = [
-        "№", "Дата", "Описание", "Сумма", "Сумма долей",
-        "Кто платил", "Кто добавил",
+        "№", "Дата", "Описание", f"Сумма, {base}", f"Сумма долей, {base}",
+        "Кто платил", "Кто добавил", "Оплачено в валюте", "Сумма в валюте",
+        f"Курс к {base}", "Чек", "Изменена",
     ] + [f"Доля: {names[uid]}" for uid in order]
 
     rows: list[list] = []
@@ -1025,21 +1573,33 @@ def _expenses_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]
         total += e["amount_cents"]
         for uid, cents in shares.items():
             share_totals[uid] = share_totals.get(uid, 0) + cents
+        orig_currency = e["orig_currency"]
+        rate = (
+            e["amount_cents"] / e["orig_amount_cents"]
+            if orig_currency and e["orig_amount_cents"]
+            else None
+        )
         rows.append(
             [
                 e["id"],
-                format_time(e["created_at"]),
+                format_time(e["created_at"], tz),
                 e["desc"],
                 Money(e["amount_cents"]),
                 Money(sum(shares.values())),
                 names[e["payer"]],
                 names[e["created_by"]] if e["created_by"] else "",
+                orig_currency,
+                Money(e["orig_amount_cents"]) if orig_currency else None,
+                rate,
+                "да" if e["receipt"] else "",
+                format_time(e["updated_at"], tz) if e["updated_at"] else "",
             ]
             + [Money(shares[uid]) if uid in shares else None for uid in order]
         )
 
     rows.append(
-        ["", "", "ИТОГО", Money(total), Money(sum(share_totals.values())), "", ""]
+        ["", "", "ИТОГО", Money(total), Money(sum(share_totals.values())),
+         "", "", "", None, None, "", ""]
         + [Money(share_totals.get(uid, 0)) for uid in order]
     )
     return ("Траты", header, rows)
@@ -1067,18 +1627,20 @@ def _totals_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]]:
         sent[s["from"]] = sent.get(s["from"], 0) + s["amount_cents"]
         received[s["to"]] = received.get(s["to"], 0) + s["amount_cents"]
 
+    base = data["currency"]
     header = [
-        "Участник", "Оплатил", "Его доля", "Отдал по расчётам",
-        "Получил по расчётам", "Баланс", "Итог",
+        "Участник", f"Оплатил, {base}", f"Его доля, {base}",
+        f"Отдал по расчётам, {base}", f"Получил по расчётам, {base}",
+        f"Баланс, {base}", "Итог",
     ]
     rows: list[list] = []
     totals = [0, 0, 0, 0, 0]
     for uid in order:
         balance = paid[uid] - consumed[uid] + sent[uid] - received[uid]
         if balance > 0:
-            verdict = f"должны вернуть {format_cents(balance)}"
+            verdict = f"должны вернуть {format_cents(balance, base)}"
         elif balance < 0:
-            verdict = f"должен(на) {format_cents(-balance)}"
+            verdict = f"должен(на) {format_cents(-balance, base)}"
         else:
             verdict = "в расчёте"
         rows.append([
@@ -1101,7 +1663,7 @@ def _totals_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]]:
 
 def _transfers_sheet(data: dict) -> tuple[str, list, list[list]]:
     names = data["names"]
-    header = ["Должник", "Получатель", "Сумма"]
+    header = ["Должник", "Получатель", f"Сумма, {data['currency']}"]
     rows = [
         [names[frm], names[to], Money(amount)]
         for (frm, to), amount in sorted(
@@ -1114,17 +1676,19 @@ def _transfers_sheet(data: dict) -> tuple[str, list, list[list]]:
     return ("Кто кому платит", header, rows)
 
 
-def _settlements_sheet(data: dict) -> tuple[str, list, list[list]]:
+def _settlements_sheet(data: dict, tz: int) -> tuple[str, list, list[list]]:
     names = data["names"]
-    header = ["№", "Дата", "Кто отдал", "Кому", "Сумма", "Учтён в расчётах"]
+    header = [
+        "№", "Дата", "Кто отдал", "Кому", f"Сумма, {data['currency']}", "Статус",
+    ]
     rows = [
         [
             s["id"],
-            format_time(s["created_at"]),
+            format_time(s["created_at"], tz),
             names[s["from"]],
             names[s["to"]],
             Money(s["amount_cents"]),
-            "да" if s["counted"] else "нет",
+            "подтверждён" if s["counted"] else "ждёт подтверждения",
         ]
         for s in data["settlements"]
     ]
@@ -1133,13 +1697,15 @@ def _settlements_sheet(data: dict) -> tuple[str, list, list[list]]:
     return ("Платежи", header, rows)
 
 
-def _howto_sheet(data: dict) -> tuple[str, list, list[list]]:
+def _howto_sheet(data: dict, tz: int) -> tuple[str, list, list[list]]:
     return (
         "Как проверить",
         ["Как проверить расчёт вручную"],
         [[line] for line in [
             f"Группа #{data['group_id']}: {data['title']}",
-            f"Выгружено: {format_time(now_unix())}",
+            f"Валюта группы: {data['currency']} — все суммы в ней.",
+            f"Выгружено: {format_time(now_unix(), tz)},"
+            f" время в {tz_label(tz)} (сменить: /tz +3)",
             "",
             "Лист «Траты» — исходные данные, по одной строке на трату.",
             "  Плательщик отдал всю сумму, а колонки «Доля: …» показывают,",
@@ -1155,17 +1721,28 @@ def _howto_sheet(data: dict) -> tuple[str, list, list[list]]:
             "  если А должен Б, а Б должен В, бот убирает Б и просит А платить В.",
             "  Итоговые суммы у каждого человека при этом не меняются.",
             "",
-            "Лист «Платежи» — уже проведённые расчёты между людьми.",
-            "  Они уменьшают долг и попадают в колонки «Отдал/Получил по расчётам».",
+            "Лист «Платежи» — расчёты между людьми.",
+            "  Долг уменьшают только подтверждённые получателем платежи;",
+            "  строки «ждёт подтверждения» ни на что пока не влияют.",
+            "",
+            "Трата, оплаченная в другой валюте, хранит и то, что реально отдали:",
+            "  колонки «Оплачено в валюте», «Сумма в валюте» и «Курс».",
+            "  В долгах участвует только сумма в валюте группы.",
+            "",
+            "Колонка «Чек» помечает траты, к которым приложено фото чека —",
+            "  его видно в боте на карточке траты.",
             "",
             "Удалённые траты в выгрузку не попадают: они не участвуют и в долгах.",
-            "Суммы указаны в тех же единицах, что и в боте.",
         ]],
     )
 
 
-def build_group_workbook(data: dict) -> bytes:
-    """Render one group's ledger as an .xlsx workbook."""
+def build_group_workbook(data: dict, tz: int = 0) -> bytes:
+    """Render one group's ledger as an .xlsx workbook.
+
+    ``tz`` is the requesting user's offset from UTC in minutes: the file
+    is read by a person, so it should carry their clock, not the server's.
+    """
     # Members first, in the order the bot shows them, then anyone who appears
     # only in old rows — a name must never silently drop a share.
     order = [m["id"] for m in data["members"]]
@@ -1182,11 +1759,11 @@ def build_group_workbook(data: dict) -> bytes:
                 order.append(uid)
 
     return build_xlsx([
-        _expenses_sheet(data, order),
+        _expenses_sheet(data, order, tz),
         _totals_sheet(data, order),
         _transfers_sheet(data),
-        _settlements_sheet(data),
-        _howto_sheet(data),
+        _settlements_sheet(data, tz),
+        _howto_sheet(data, tz),
     ])
 
 
@@ -1225,6 +1802,42 @@ def _set_ae(ctx: ContextTypes.DEFAULT_TYPE, state: dict) -> None:
 
 def _del_ae(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data.pop("add_expense", None)
+
+
+def _get_pay(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
+    return ctx.user_data.get("pay_part")
+
+
+def _set_pay(ctx: ContextTypes.DEFAULT_TYPE, state: dict) -> None:
+    ctx.user_data["pay_part"] = state
+
+
+def _del_pay(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.pop("pay_part", None)
+
+
+def _get_receipt(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
+    return ctx.user_data.get("receipt_for")
+
+
+def _set_receipt(ctx: ContextTypes.DEFAULT_TYPE, state: dict) -> None:
+    ctx.user_data["receipt_for"] = state
+
+
+def _del_receipt(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.pop("receipt_for", None)
+
+
+def _get_group_input(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
+    return ctx.user_data.get("group_input")
+
+
+def _set_group_input(ctx: ContextTypes.DEFAULT_TYPE, state: dict) -> None:
+    ctx.user_data["group_input"] = state
+
+
+def _del_group_input(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.pop("group_input", None)
 
 
 def _is_new_group(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1312,12 +1925,18 @@ class App:
         text: str,
         markup: Optional[InlineKeyboardMarkup] = None,
     ) -> None:
-        if update.callback_query and update.callback_query.message:
-            await update.callback_query.message.edit_text(
-                text, reply_markup=markup
-            )
-        else:
-            await update.effective_chat.send_message(text, reply_markup=markup)
+        """Show a screen, splitting it up if it outgrew one message.
+
+        The buttons ride on the last piece, where the reader ends up.
+        """
+        chunks = split_message(text)
+        message = update.callback_query.message if update.callback_query else None
+        for i, chunk in enumerate(chunks):
+            tail = markup if i == len(chunks) - 1 else None
+            if i == 0 and message:
+                await message.edit_text(chunk, reply_markup=tail)
+            else:
+                await update.effective_chat.send_message(chunk, reply_markup=tail)
 
     # ---------- Command handlers ----------
 
@@ -1350,20 +1969,58 @@ class App:
                 pass
 
         await update.effective_chat.send_message(
-            "Привет! Я помогу делить траты в поездках.\nИспользуйте кнопки ниже.",
+            "Привет! Я помогу делить траты в поездках.\nИспользуйте кнопки ниже.\n"
+            f"Время показываю в {tz_label(self.repo.user_tz(user.id))}"
+            " — сменить можно командой /tz +3.",
             reply_markup=main_keyboard(),
         )
 
     async def on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await self._refresh_keyboard(update, update.effective_user.id)
-        if _get_ae(ctx) or _is_new_group(ctx):
+        if (
+            _get_ae(ctx)
+            or _is_new_group(ctx)
+            or _get_pay(ctx)
+            or _get_receipt(ctx)
+            or _get_group_input(ctx)
+        ):
             _del_ae(ctx)
+            _del_pay(ctx)
+            _del_receipt(ctx)
+            _del_group_input(ctx)
             _set_new_group(ctx, False)
             await update.effective_chat.send_message(
                 "Ок, отменил. Можно начать заново.", reply_markup=main_keyboard()
             )
         else:
             await update.effective_chat.send_message("Нечего отменять.")
+
+    async def on_tz(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Set the offset every timestamp this user sees is rendered in."""
+        uid = update.effective_user.id
+        self.repo.upsert_user(uid, self._best_name(update.effective_user))
+        await self._refresh_keyboard(update, uid)
+
+        raw = " ".join(ctx.args or []).strip()
+        if not raw:
+            await update.effective_chat.send_message(
+                f"Ваш часовой пояс: {tz_label(self.repo.user_tz(uid))}.\n"
+                "Сменить: /tz +3, /tz -05:30, /tz 0."
+            )
+            return
+        try:
+            offset = parse_tz_offset(raw)
+        except ValueError:
+            await update.effective_chat.send_message(
+                "Не понял смещение. Примеры: /tz +3, /tz -05:30, /tz 0."
+            )
+            return
+
+        self.repo.set_user_tz(uid, offset)
+        await update.effective_chat.send_message(
+            f"Часовой пояс: {tz_label(offset)}."
+            f" Сейчас это {format_time(now_unix(), offset)}."
+        )
 
     async def on_join(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id
@@ -1394,6 +2051,19 @@ class App:
                 "Неверный или истёкший код приглашения."
             )
 
+    # ---------- Photo handler ----------
+
+    async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        uid = update.effective_user.id
+        self.repo.upsert_user(uid, self._best_name(update.effective_user))
+        await self._refresh_keyboard(update, uid)
+        if _get_receipt(ctx) is None:
+            await update.effective_chat.send_message(
+                "Чтобы приложить чек, откройте трату и нажмите «📎 Приложить чек»."
+            )
+            return
+        await self._flow_receipt(update, ctx)
+
     # ---------- Text handler ----------
 
     async def on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1403,14 +2073,21 @@ class App:
         await self._refresh_keyboard(update, uid)
 
         # Block top-level buttons while wizard is active
-        if (_is_new_group(ctx) or _get_ae(ctx)) and txt in _TOP_BUTTONS:
+        wizard_running = (
+            _is_new_group(ctx)
+            or _get_ae(ctx) is not None
+            or _get_pay(ctx) is not None
+            or _get_receipt(ctx) is not None
+            or _get_group_input(ctx) is not None
+        )
+        if wizard_running and txt in _TOP_BUTTONS:
             await update.effective_chat.send_message(
                 "Сейчас идёт мастер. Отправьте запрошенные данные"
                 " или нажмите /cancel (или «❌ Отмена»)."
             )
             return
 
-        in_wizard = _is_new_group(ctx) or _get_ae(ctx) is not None
+        in_wizard = wizard_running
 
         if not in_wizard:
             # /start@<code> or /start_<code>
@@ -1482,13 +2159,36 @@ class App:
             enc = quote(f"/join {code}", safe="")
             share_href = f"https://t.me/share/url?url={enc}"
             html_join = f'<a href="{share_href}">/join {code}</a>'
-            text = f"Группа #{gid} создана: {html.escape(title)}\nКоманда: {html_join}"
+            currency = self.repo.group_currency(gid)
+            text = (
+                f"Группа #{gid} создана: {html.escape(title)}\n"
+                f"Валюта: {currency} — сменить можно в настройках группы,"
+                f" пока в ней нет трат.\n"
+                f"Команда: {html_join}"
+            )
             await update.effective_chat.send_message(
                 text,
                 reply_markup=main_keyboard(),
                 parse_mode=ParseMode.HTML,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
+            return
+
+        # Group settings text input
+        group_input = _get_group_input(ctx)
+        if group_input is not None:
+            await self._flow_group_input(update, ctx, group_input, txt)
+            return
+
+        # Waiting for a receipt photo
+        if _get_receipt(ctx) is not None:
+            await self._flow_receipt(update, ctx)
+            return
+
+        # Partial payment amount
+        pay = _get_pay(ctx)
+        if pay is not None:
+            await self._flow_pay_part(update, ctx, pay, txt)
             return
 
         # Add-expense wizard
@@ -1536,6 +2236,48 @@ class App:
         elif txt == "💰 Долги" or txt in _LEGACY_DEBT_BUTTONS:
             await self._show_debts(update, ctx)
 
+    async def _flow_pay_part(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        pay: dict,
+        txt: str,
+    ) -> None:
+        currency = pay["currency"]
+        try:
+            amount = cents_from_str(txt.strip())
+            if amount <= 0:
+                raise ValueError("non-positive")
+        except Exception:
+            await update.effective_chat.send_message(
+                f"Сумма не распознана. Пришлите число, напр. 350.50"
+                f" (не больше {format_cents(pay['max'], currency)}).",
+                reply_markup=inline_cancel(),
+            )
+            return
+
+        if amount > pay["max"]:
+            await update.effective_chat.send_message(
+                f"Это больше долга. Максимум — {format_cents(pay['max'], currency)}.",
+                reply_markup=inline_cancel(),
+            )
+            return
+
+        _del_pay(ctx)
+        if await self._request_payment(update, ctx, pay["to"], currency, amount):
+            await update.effective_chat.send_message(
+                f"Отправил(а) {self.repo.user_name(pay['to'])} запрос на"
+                f" подтверждение {format_cents(amount, currency)}."
+                " Долг закроется, когда получатель подтвердит.",
+                reply_markup=main_keyboard(),
+            )
+        else:
+            await update.effective_chat.send_message(
+                "Расчёт уже изменился — откройте «💰 Долги» заново.",
+                reply_markup=main_keyboard(),
+            )
+        await self._show_debts(update, ctx)
+
     # ---------- Add-expense wizard (text steps) ----------
 
     async def _flow_add_expense(
@@ -1548,7 +2290,7 @@ class App:
         step = st.get("step")
 
         if step == "await_amount_desc":
-            amount_text, description = split_amount_and_description(txt)
+            amount_text, currency, description = split_amount_currency_desc(txt)
             if not amount_text:
                 await update.effective_chat.send_message(
                     "Нужно прислать сумму и описание. Пример: 1200 обед",
@@ -1566,10 +2308,54 @@ class App:
                 )
                 return
 
-            st["amount_cents"] = amt
+            base = st.get("currency") or self.repo.group_currency(st["group_id"])
+            st["currency"] = base
             st["description"] = description or "Без описания"
+
+            # Paid in another currency: the group's ledger stays in one unit,
+            # so ask what actually left the payer's account instead of
+            # inventing a rate nobody agreed on.
+            if currency and currency != base:
+                st["orig_currency"] = currency
+                st["orig_amount_cents"] = amt
+                st["step"] = "await_base_amount"
+                _set_ae(ctx, st)
+                await update.effective_chat.send_message(
+                    f"{format_cents(amt, currency)} — сколько это в {base}?"
+                    f" Пришлите сумму, которую с вас списали.",
+                    reply_markup=inline_cancel(),
+                )
+                return
+
+            st["amount_cents"] = amt
             st["step"] = "choose_payer"
             _set_ae(ctx, st)
+            await self._ask_payer(update, ctx, st)
+
+        elif step == "await_base_amount":
+            base = st.get("currency") or self.repo.group_currency(st["group_id"])
+            try:
+                amt = cents_from_str(txt.strip())
+                if amt <= 0:
+                    raise ValueError("non-positive")
+            except Exception:
+                await update.effective_chat.send_message(
+                    f"Сумма не распознана. Пришлите, сколько это в {base},"
+                    f" напр. 9500",
+                    reply_markup=inline_cancel(),
+                )
+                return
+
+            st["amount_cents"] = amt
+            st["step"] = "choose_payer"
+            _set_ae(ctx, st)
+            rate = format_rate(
+                amt, st["orig_amount_cents"], base, st["orig_currency"]
+            )
+            await update.effective_chat.send_message(
+                f"Записал: {format_cents(st['orig_amount_cents'], st['orig_currency'])}"
+                f" = {format_cents(amt, base)}" + (f" ({rate})" if rate else "")
+            )
             await self._ask_payer(update, ctx, st)
 
         elif step == "await_custom_share":
@@ -1671,6 +2457,9 @@ class App:
 
         if data == "cancel_flow":
             _del_ae(ctx)
+            _del_pay(ctx)
+            _del_receipt(ctx)
+            _del_group_input(ctx)
             _set_new_group(ctx, False)
             await self._edit_or_send(update, "Отменено. Что дальше?")
             await query.answer("Отменено")
@@ -1713,6 +2502,7 @@ class App:
             if not self.repo.is_group_member(gid, uid):
                 await query.answer("Нет доступа", show_alert=True)
                 return
+            base = self.repo.group_currency(gid)
             _set_ae(ctx, {
                 "group_id": gid,
                 "amount_cents": 0,
@@ -1722,11 +2512,15 @@ class App:
                 "split_mode": "",
                 "custom_left": [],
                 "custom_shares": {},
+                "currency": base,
+                "orig_currency": "",
+                "orig_amount_cents": 0,
                 "step": "await_amount_desc",
             })
             await update.effective_chat.send_message(
-                f"Группа #{gid} выбрана. Пришлите сумму и описание одним"
-                f" сообщением, напр.:\n1500 такси из аэропорта"
+                f"Группа #{gid} выбрана, валюта — {base}. Пришлите сумму и"
+                f" описание одним сообщением, напр.:\n1500 такси из аэропорта\n"
+                f"Платили в другой валюте — укажите её: 100 EUR ужин"
             )
             await query.answer("Группа выбрана")
             return
@@ -1755,6 +2549,86 @@ class App:
             await query.answer()
             return
 
+        # One expense in full
+        if data.startswith("expcard|"):
+            parts = data.split("|")
+            if (
+                len(parts) >= 4
+                and parts[2].startswith("gid:")
+                and parts[3].startswith("p:")
+            ):
+                eid = int(parts[1])
+                gid = int(parts[2][4:])
+                page = int(parts[3][2:])
+                if not self.repo.is_group_member(gid, uid):
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
+                await self._send_expense_card(update, ctx, gid, eid, page)
+                await query.answer()
+                return
+            await query.answer("Ошибка")
+            return
+
+        # Edit, receipt attach / show / remove — all creator-only
+        if (
+            data.startswith("expedit|")
+            or data.startswith("exprcpt|")
+            or data.startswith("expshow|")
+            or data.startswith("exprdel|")
+        ):
+            parts = data.split("|")
+            if not (
+                len(parts) >= 4
+                and parts[2].startswith("gid:")
+                and parts[3].startswith("p:")
+            ):
+                await query.answer("Ошибка")
+                return
+            action = parts[0]
+            eid = int(parts[1])
+            gid = int(parts[2][4:])
+            page = int(parts[3][2:])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
+
+            if action == "expshow":
+                item = self.repo.get_expense(eid, gid)
+                if not item or not item["receipt"]:
+                    await query.answer("Чека нет", show_alert=True)
+                    return
+                await query.answer()
+                await update.effective_chat.send_photo(
+                    item["receipt"], caption=f"Чек к трате #{eid}"
+                )
+                return
+
+            if not self.repo.can_edit_expense(eid, gid, uid):
+                await query.answer(
+                    "Менять трату может только тот, кто её добавил",
+                    show_alert=True,
+                )
+                return
+
+            if action == "expedit":
+                await query.answer()
+                await self._start_expense_edit(update, ctx, gid, eid, page)
+                return
+            if action == "exprcpt":
+                _set_receipt(ctx, {"group_id": gid, "expense_id": eid, "page": page})
+                await query.answer()
+                await update.effective_chat.send_message(
+                    f"Пришлите фото чека для траты #{eid} одним сообщением"
+                    f" (или /cancel).",
+                    reply_markup=inline_cancel(),
+                )
+                return
+
+            self.repo.set_receipt(eid, gid, "")
+            await query.answer("Чек убран")
+            await self._send_expense_card(update, ctx, gid, eid, page)
+            return
+
         # Delete expense
         # Bug fix: parts[0] is "expdel", parts[1] is the expense ID.
         # The Go original used parts[0] stripped of "expdel|", which left
@@ -1775,6 +2649,7 @@ class App:
                         return
                     self.repo.delete_expense(eid)
                     await query.answer("Удалено")
+                    _del_receipt(ctx)
                     await self._send_expenses_page(update, ctx, gid, page)
                     return
                 except Exception:
@@ -1788,53 +2663,257 @@ class App:
             await query.answer()
             return
 
-        # Settle everything with one counterparty, across all shared groups
+        # Claim a payment to one counterparty in one currency. Nothing is
+        # settled until the person who is owed the money confirms it.
         if data.startswith("paynet|"):
+            parts = data.split("|")
+            if (
+                len(parts) == 4
+                and parts[1].startswith("to:")
+                and parts[2].startswith("cur:")
+                and parts[3].startswith("amt:")
+            ):
+                to = int(parts[1][3:])
+                currency = parts[2][4:]
+                amt = int(parts[3][4:])
+                try:
+                    if await self._request_payment(update, ctx, to, currency, amt):
+                        await query.answer("Отправлено на подтверждение")
+                    else:
+                        await query.answer("Расчёт уже не актуален", show_alert=True)
+                    await self._show_debts(update, ctx)
+                    return
+                except Exception:
+                    logger.exception("failed to request settlement")
+            await query.answer("Ошибка подтверждения")
+            return
+
+        # Hand over part of a debt
+        if data.startswith("paypart|"):
             parts = data.split("|")
             if (
                 len(parts) == 3
                 and parts[1].startswith("to:")
-                and parts[2].startswith("amt:")
+                and parts[2].startswith("cur:")
             ):
                 to = int(parts[1][3:])
-                amt = int(parts[2][4:])
-                try:
-                    if not self.repo.settle_with_user(uid, to, amt):
-                        await query.answer("Расчёт уже не актуален", show_alert=True)
-                        try:
-                            await self._show_debts(update, ctx)
-                        except Exception:
-                            logger.info("failed to refresh stale debts screen")
-                        return
-                    from_name = self.repo.user_name(uid)
-                    to_name = self.repo.user_name(to)
-                    if amt > 0:
-                        for chat, text in (
-                            (to, f"Вам оплатили {format_cents(amt)} от {from_name}."
-                                 f" Все взаимные долги закрыты."),
-                            (uid, f"Оплата {format_cents(amt)} пользователю {to_name}"
-                                  f" зафиксирована. Все взаимные долги закрыты."),
-                        ):
-                            try:
-                                await ctx.bot.send_message(chat, text)
-                            except Exception:
-                                logger.info("failed to notify %s about payment", chat)
-                        await query.answer("Оплата подтверждена")
-                    else:
-                        try:
-                            await ctx.bot.send_message(
-                                to,
-                                f"{from_name} закрыл(а) взаимные расчёты с вами:"
-                                f" долги погасили друг друга, переводить нечего.",
-                            )
-                        except Exception:
-                            logger.info("failed to notify %s about netting", to)
-                        await query.answer("Взаимные долги закрыты")
+                currency = parts[2][4:]
+                entry = self.repo.compute_user_debts(uid).get(to, {}).get(currency)
+                owed = -entry["net"] if entry else 0
+                if owed <= 0:
+                    await query.answer("Этот долг уже закрыт", show_alert=True)
                     await self._show_debts(update, ctx)
                     return
+                _set_pay(ctx, {"to": to, "currency": currency, "max": owed})
+                await query.answer()
+                await self._edit_or_send(
+                    update,
+                    f"Сколько вы отдали — {self.repo.user_name(to)}?"
+                    f" Весь долг: {format_cents(owed, currency)}."
+                    f" Пришлите сумму одним сообщением.",
+                    inline_cancel(),
+                )
+                return
+            await query.answer("Ошибка")
+            return
+
+        # Confirm or refuse a payment claim
+        if data.startswith("paycfm|") or data.startswith("payrej|"):
+            batch = data.split("|", 1)[1]
+            info = self.repo.batch_info(batch)
+            if info is None or info["confirmed"]:
+                await query.answer("Запрос уже закрыт", show_alert=True)
+                await self._show_debts(update, ctx)
+                return
+
+            amount = format_cents(info["amount_cents"], info["currency"])
+            other = info["from"] if info["to"] == uid else info["to"]
+            actor = self.repo.user_name(uid)
+
+            if data.startswith("paycfm|"):
+                if not self.repo.confirm_settlement(batch, uid):
+                    await query.answer(
+                        "Подтвердить может только тот, кому платили",
+                        show_alert=True,
+                    )
+                    return
+                note = (
+                    f"{actor} подтвердил(а) получение {amount}."
+                    " Долг закрыт."
+                    if info["amount_cents"] > 0
+                    else f"{actor} подтвердил(а) закрытие взаимных расчётов."
+                )
+                await query.answer("Подтверждено")
+            else:
+                if not self.repo.reject_settlement(batch, uid):
+                    await query.answer("Нельзя отменить этот запрос", show_alert=True)
+                    return
+                if info["from"] == uid:
+                    note = f"{actor} отменил(а) свой запрос на {amount}."
+                else:
+                    note = (
+                        f"{actor} не подтвердил(а) получение {amount}."
+                        " Долг остаётся — свяжитесь и разберитесь."
+                    )
+                await query.answer("Запрос отменён")
+
+            try:
+                await ctx.bot.send_message(other, note)
+            except Exception:
+                logger.info("failed to notify %s about a payment claim", other)
+            await self._show_debts(update, ctx)
+            return
+
+        # Group settings
+        if data.startswith("gset|"):
+            gid = int(data[len("gset|"):])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
+            await self._send_group_settings(update, ctx, gid)
+            await query.answer()
+            return
+
+        if data.startswith("grename|") or data.startswith("gcurother|"):
+            gid = int(data.split("|", 1)[1])
+            if not self.repo.is_group_owner(gid, uid):
+                await query.answer("Только владелец группы", show_alert=True)
+                return
+            kind = "rename" if data.startswith("grename|") else "currency"
+            _set_group_input(ctx, {"group_id": gid, "kind": kind})
+            await query.answer()
+            prompt = (
+                "Пришлите новое название группы одним сообщением."
+                if kind == "rename"
+                else "Пришлите код валюты, напр. NOK."
+            )
+            await self._edit_or_send(update, prompt, inline_cancel())
+            return
+
+        if data.startswith("gcur|"):
+            gid = int(data[len("gcur|"):])
+            if not self.repo.is_group_owner(gid, uid):
+                await query.answer("Только владелец группы", show_alert=True)
+                return
+            await self._send_currency_picker(update, gid)
+            await query.answer()
+            return
+
+        if data.startswith("gcurset|"):
+            parts = data.split("|")
+            if len(parts) == 3:
+                gid = int(parts[1])
+                if not self.repo.is_group_owner(gid, uid):
+                    await query.answer("Только владелец группы", show_alert=True)
+                    return
+                if self.repo.set_group_currency(gid, parts[2]):
+                    await query.answer(f"Валюта: {parts[2]}")
+                else:
+                    await query.answer(
+                        "Валюту уже не сменить: в группе есть траты",
+                        show_alert=True,
+                    )
+                await self._send_group_settings(update, ctx, gid)
+                return
+            await query.answer("Ошибка")
+            return
+
+        if data.startswith("gleave|"):
+            gid = int(data[len("gleave|"):])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
+            balance = self.repo.member_balance(gid, uid)
+            if balance:
+                await query.answer(
+                    "Сначала закройте долги в этой группе", show_alert=True
+                )
+                return
+            warning = ""
+            if self.repo.is_group_owner(gid, uid):
+                heir = self.repo.next_owner(gid, uid)
+                warning = (
+                    f"\nВы владелец: группа перейдёт к"
+                    f" {self.repo.user_name(heir)}."
+                    if heir
+                    else "\nВы последний участник: группа будет удалена"
+                         " вместе со всеми тратами."
+                )
+            await self._edit_or_send(
+                update,
+                f"Выйти из группы #{gid}?"
+                f" Ваши прошлые траты останутся в истории.{warning}",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "Да, выйти", callback_data=f"gleaveyes|{gid}"
+                    )],
+                    [InlineKeyboardButton("Отмена", callback_data=f"gset|{gid}")],
+                ]),
+            )
+            await query.answer()
+            return
+
+        if data.startswith("gleaveyes|"):
+            gid = int(data[len("gleaveyes|"):])
+            result = await self._leave_group(update, ctx, gid)
+            if result == "has_debt":
+                await query.answer(
+                    "Сначала закройте долги в этой группе", show_alert=True
+                )
+                return
+            if result == "not_member":
+                await query.answer("Вы уже не в группе", show_alert=True)
+                return
+            await query.answer("Готово")
+            markup, total = self._groups_page_keyboard(uid, 0, "mg")
+            await self._edit_or_send(
+                update,
+                "Выберите группу:" if total else "У вас нет групп.",
+                markup if total else None,
+            )
+            return
+
+        # Owner removes a member
+        if data.startswith("memdel|"):
+            parts = data.split("|")
+            if (
+                len(parts) >= 4
+                and parts[2].startswith("gid:")
+                and parts[3].startswith("p:")
+            ):
+                target = int(parts[1])
+                gid = int(parts[2][4:])
+                page = int(parts[3][2:])
+                if not self.repo.is_group_owner(gid, uid):
+                    await query.answer("Только владелец группы", show_alert=True)
+                    return
+                reason = self.repo.remove_member(gid, target)
+                if reason == "has_debt":
+                    await query.answer(
+                        "У участника есть незакрытый баланс", show_alert=True
+                    )
+                    return
+                if reason:
+                    await query.answer("Не получилось удалить", show_alert=True)
+                    return
+                try:
+                    await ctx.bot.send_message(
+                        target,
+                        f"Вас удалили из группы #{gid}"
+                        f" ({self.repo.get_group_title(gid)}).",
+                    )
                 except Exception:
-                    logger.exception("failed to settle with user")
-            await query.answer("Ошибка подтверждения")
+                    logger.info("failed to notify %s about removal", target)
+                await query.answer("Участник удалён")
+                await self._send_members_page(update, gid, page)
+                return
+            await query.answer("Ошибка")
+            return
+
+        if data.startswith("memnote|"):
+            await query.answer(
+                "Сначала нужно закрыть его долги в этой группе", show_alert=True
+            )
             return
 
         # Delete group (owner only)
@@ -2026,6 +3105,7 @@ class App:
             return
 
         bal = self.repo.compute_group_balances(gid)
+        currency = self.repo.group_currency(gid)
 
         cmd = f"/join {code}"
         enc = quote(cmd, safe="")
@@ -2038,16 +3118,22 @@ class App:
                 continue
             if frm == uid:
                 you_owe.append(
-                    f"вы → {html.escape(self.repo.user_name(to))}: {format_cents(v)}"
+                    f"вы → {html.escape(self.repo.user_name(to))}:"
+                    f" {format_cents(v, currency)}"
                 )
             elif to == uid:
                 owe_you.append(
-                    f"{html.escape(self.repo.user_name(frm))} → вам: {format_cents(v)}"
+                    f"{html.escape(self.repo.user_name(frm))} → вам:"
+                    f" {format_cents(v, currency)}"
                 )
         you_owe.sort()
         owe_you.sort()
 
-        lines = [f"Группа #{gid}\n", f"Команда: {cmd_html}\n"]
+        lines = [
+            f"Группа #{gid}\n",
+            f"Валюта: {currency}\n",
+            f"Команда: {cmd_html}\n",
+        ]
         if not you_owe and not owe_you:
             lines.append("В этой группе долгов нет 🎉")
         else:
@@ -2076,10 +3162,9 @@ class App:
             ],
             [InlineKeyboardButton("📊 Выгрузить в Excel", callback_data=f"xlsx|{gid}")],
         ]
-        if self.repo.is_group_owner(gid, uid):
-            rows.append([InlineKeyboardButton(
-                "🗑 Удалить группу", callback_data=f"grpdel|gid:{gid}"
-            )])
+        rows.append([InlineKeyboardButton(
+            "⚙️ Настройки группы", callback_data=f"gset|{gid}"
+        )])
         rows.append([InlineKeyboardButton(
             "« Мои группы", callback_data="mg|p:0"
         )])
@@ -2094,6 +3179,171 @@ class App:
             await update.callback_query.message.edit_text(text, **opts)
         else:
             await update.effective_chat.send_message(text, **opts)
+
+    async def _send_group_settings(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, gid: int
+    ) -> None:
+        uid = update.effective_user.id
+        title = self.repo.get_group_title(gid)
+        currency = self.repo.group_currency(gid)
+        is_owner = self.repo.is_group_owner(gid, uid)
+        balance = self.repo.member_balance(gid, uid)
+
+        lines = [
+            f"Настройки группы #{gid}\n",
+            f"Название: {title}\n",
+            f"Валюта: {currency}\n",
+            f"Вы: {'владелец' if is_owner else 'участник'}\n",
+        ]
+        if balance:
+            side = "вам должны" if balance > 0 else "вы должны"
+            lines.append(
+                f"\nВаш баланс здесь: {side} {format_cents(abs(balance), currency)}."
+                " Выйти можно только с нулевым балансом.\n"
+            )
+        if not self.repo.can_change_currency(gid):
+            lines.append(
+                "\nВалюту уже не сменить: в группе есть траты или платежи,"
+                " все суммы записаны в текущей валюте.\n"
+            )
+
+        rows = []
+        if is_owner:
+            rows.append([InlineKeyboardButton(
+                "✏️ Переименовать", callback_data=f"grename|{gid}"
+            )])
+            if self.repo.can_change_currency(gid):
+                rows.append([InlineKeyboardButton(
+                    f"💱 Валюта: {currency}", callback_data=f"gcur|{gid}"
+                )])
+        rows.append([InlineKeyboardButton(
+            "👥 Участники", callback_data=f"members|{gid}|p:0"
+        )])
+        rows.append([InlineKeyboardButton(
+            "🚪 Выйти из группы", callback_data=f"gleave|{gid}"
+        )])
+        if is_owner:
+            rows.append([InlineKeyboardButton(
+                "🗑 Удалить группу", callback_data=f"grpdel|gid:{gid}"
+            )])
+        rows.append([InlineKeyboardButton(
+            "« Назад к группе", callback_data=f"mgsel|{gid}"
+        )])
+
+        await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup(rows))
+
+    async def _send_currency_picker(self, update: Update, gid: int) -> None:
+        current = self.repo.group_currency(gid)
+        common = ["RUB", "USD", "EUR", "TRY", "GEL", "KZT", "AMD", "RSD", "THB", "AED"]
+        rows, row = [], []
+        for code in common:
+            mark = "✅ " if code == current else ""
+            row.append(InlineKeyboardButton(
+                f"{mark}{code}", callback_data=f"gcurset|{gid}|{code}"
+            ))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton(
+            "Другая — ввести код", callback_data=f"gcurother|{gid}"
+        )])
+        rows.append([InlineKeyboardButton(
+            "« Назад", callback_data=f"gset|{gid}"
+        )])
+        await self._edit_or_send(
+            update,
+            f"Валюта группы #{gid}. Сейчас: {current}.\n"
+            "Все суммы в группе будут считаться в ней; сменить получится,"
+            " только пока нет трат.",
+            InlineKeyboardMarkup(rows),
+        )
+
+    async def _flow_group_input(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        state: dict,
+        txt: str,
+    ) -> None:
+        gid, kind = state["group_id"], state["kind"]
+        if not self.repo.is_group_owner(gid, update.effective_user.id):
+            _del_group_input(ctx)
+            await update.effective_chat.send_message(
+                "Менять настройки может только владелец группы.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        if kind == "rename":
+            if not txt.strip() or txt.startswith("/"):
+                await update.effective_chat.send_message(
+                    "Название не может быть пустым. Пришлите новое название"
+                    " одним сообщением.",
+                    reply_markup=inline_cancel(),
+                )
+                return
+            self.repo.rename_group(gid, txt)
+            _del_group_input(ctx)
+            await update.effective_chat.send_message(
+                f"Группа #{gid} теперь называется «{self.repo.get_group_title(gid)}».",
+                reply_markup=main_keyboard(),
+            )
+        else:
+            code = normalize_currency(txt)
+            if not code:
+                await update.effective_chat.send_message(
+                    "Не знаю такую валюту. Пришлите трёхбуквенный код,"
+                    " напр. NOK.",
+                    reply_markup=inline_cancel(),
+                )
+                return
+            if not self.repo.set_group_currency(gid, code):
+                _del_group_input(ctx)
+                await update.effective_chat.send_message(
+                    "Валюту уже не сменить: в группе есть траты или платежи.",
+                    reply_markup=main_keyboard(),
+                )
+                return
+            _del_group_input(ctx)
+            await update.effective_chat.send_message(
+                f"Валюта группы #{gid}: {code}.", reply_markup=main_keyboard()
+            )
+
+        await self._send_group_settings(update, ctx, gid)
+
+    async def _leave_group(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, gid: int
+    ) -> str:
+        uid = update.effective_user.id
+        title = self.repo.get_group_title(gid)
+        heir = self.repo.next_owner(gid, uid) if self.repo.is_group_owner(gid, uid) else 0
+        result = self.repo.leave_group(gid, uid)
+        if result in ("has_debt", "not_member"):
+            return result
+
+        name = self.repo.user_name(uid)
+        if result == "last":
+            await update.effective_chat.send_message(
+                f"Вы вышли из группы «{title}». Участников не осталось,"
+                " поэтому группа удалена."
+            )
+            return result
+
+        for pid in (m["id"] for m in self.repo.list_members(gid)):
+            note = f"{name} вышел(а) из группы #{gid} ({title})."
+            if pid == heir:
+                note += " Группа теперь ваша: вы её владелец."
+            try:
+                await ctx.bot.send_message(pid, note)
+            except Exception:
+                logger.info("failed to notify %s about a member leaving", pid)
+
+        await update.effective_chat.send_message(
+            f"Вы вышли из группы «{title}».", reply_markup=main_keyboard()
+        )
+        return result
 
     async def _send_invite_for_group(self, update: Update, gid: int) -> None:
         try:
@@ -2142,7 +3392,9 @@ class App:
             return
 
         try:
-            content = build_group_workbook(data)
+            content = await asyncio.to_thread(
+                build_group_workbook, data, self.repo.user_tz(update.effective_user.id)
+            )
         except Exception:
             logger.exception("failed to build workbook for group %s", gid)
             await update.effective_chat.send_message("Не удалось собрать выгрузку.")
@@ -2186,21 +3438,37 @@ class App:
             )
             return
 
-        lines = [f"Траты группы #{gid} (страница {page + 1}):\n"]
+        currency = self.repo.group_currency(gid)
+        names = self.repo.names_for(
+            {it["payer"] for it in items} | {it["created_by"] for it in items if it["created_by"]}
+        )
+        lines = [f"Траты группы #{gid} (страница {page + 1}), валюта {currency}:\n"]
         for it in items:
+            paid_in = ""
+            edited = " (изменена)" if it["updated_at"] else ""
+            if it["orig_currency"]:
+                paid_in = (
+                    f" [оплачено"
+                    f" {format_cents(it['orig_amount_cents'], it['orig_currency'])}]"
+                )
+            creator = names.get(it["created_by"], "—") if it["created_by"] else "—"
             lines.append(
-                f"• #{it['id']} {it['desc']} — {format_cents(it['amount_cents'])}"
-                f" (плательщик: {self.repo.user_name(it['payer'])},"
-                f" создал: {self.repo.user_name(it['created_by'])})\n"
+                f"• #{it['id']} {it['desc']} —"
+                f" {format_cents(it['amount_cents'], currency)}{paid_in}"
+                f" (плательщик: {names[it['payer']]}, создал: {creator}){edited}\n"
             )
 
+        # A row per expense opens its card, where the split, the receipt
+        # and the edit and delete buttons live. The old screen could only
+        # offer "delete", which put the riskiest action one tap away.
         rows = []
         for it in items:
-            if self.repo.can_delete_expense(it["id"], gid, update.effective_user.id):
-                rows.append([InlineKeyboardButton(
-                    f"Удалить #{it['id']}",
-                    callback_data=f"expdel|{it['id']}|gid:{gid}|p:{page}",
-                )])
+            mark = " 🧾" if it["receipt"] else ""
+            rows.append([InlineKeyboardButton(
+                f"#{it['id']} {it['desc']} —"
+                f" {format_cents(it['amount_cents'], currency)}{mark}",
+                callback_data=f"expcard|{it['id']}|gid:{gid}|p:{page}",
+            )])
         nav = [InlineKeyboardButton("Назад к группе", callback_data=f"mgsel|{gid}")]
         if page > 0:
             nav.insert(0, InlineKeyboardButton(
@@ -2213,6 +3481,167 @@ class App:
         rows.append(nav)
 
         await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup(rows))
+
+    async def _send_expense_card(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        gid: int,
+        eid: int,
+        page: int,
+    ) -> None:
+        """One expense in full: the split, the receipt and what can be done.
+
+        The list can only ever show a line per expense; this is where a
+        person checks who was actually counted in.
+        """
+        uid = update.effective_user.id
+        item = self.repo.get_expense(eid, gid)
+        if item is None:
+            await self._edit_or_send(
+                update,
+                "Трата не найдена — возможно, её удалили.",
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "К списку трат", callback_data=f"explist|{gid}|p:{page}"
+                    )
+                ]]),
+            )
+            return
+
+        currency = self.repo.group_currency(gid)
+        tz = self.repo.user_tz(uid)
+        names = self.repo.names_for(
+            {item["payer"], *item["shares"]}
+            | ({item["created_by"]} if item["created_by"] else set())
+        )
+
+        lines = [
+            f"Трата #{item['id']}: {item['desc']}\n",
+            f"Сумма: {format_cents(item['amount_cents'], currency)}\n",
+        ]
+        if item["orig_currency"]:
+            rate = format_rate(
+                item["amount_cents"], item["orig_amount_cents"],
+                currency, item["orig_currency"],
+            )
+            lines.append(
+                f"Оплачено:"
+                f" {format_cents(item['orig_amount_cents'], item['orig_currency'])}"
+                + (f" ({rate})\n" if rate else "\n")
+            )
+        lines.append(f"Плательщик: {names[item['payer']]}\n")
+        if item["created_by"]:
+            lines.append(f"Добавил(а): {names[item['created_by']]}\n")
+        lines.append(f"Создана: {format_time(item['created_at'], tz)}\n")
+        if item["updated_at"]:
+            lines.append(f"Изменена: {format_time(item['updated_at'], tz)}\n")
+        lines.append(f"Чек: {'приложен' if item['receipt'] else 'нет'}\n")
+        lines.append("\nДоли:\n")
+        for pid, share in sorted(
+            item["shares"].items(), key=lambda kv: names[kv[0]].lower()
+        ):
+            lines.append(f"• {names[pid]}: {format_cents(share, currency)}\n")
+
+        rows = []
+        if item["receipt"]:
+            rows.append([InlineKeyboardButton(
+                "🧾 Показать чек", callback_data=f"expshow|{eid}|gid:{gid}|p:{page}"
+            )])
+        if self.repo.can_edit_expense(eid, gid, uid):
+            rows.append([InlineKeyboardButton(
+                "✏️ Изменить", callback_data=f"expedit|{eid}|gid:{gid}|p:{page}"
+            )])
+            rows.append([InlineKeyboardButton(
+                "📎 Заменить чек" if item["receipt"] else "📎 Приложить чек",
+                callback_data=f"exprcpt|{eid}|gid:{gid}|p:{page}",
+            )])
+            if item["receipt"]:
+                rows.append([InlineKeyboardButton(
+                    "🗑 Убрать чек", callback_data=f"exprdel|{eid}|gid:{gid}|p:{page}"
+                )])
+            rows.append([InlineKeyboardButton(
+                "🗑 Удалить трату", callback_data=f"expdel|{eid}|gid:{gid}|p:{page}"
+            )])
+        rows.append([InlineKeyboardButton(
+            "« К списку трат", callback_data=f"explist|{gid}|p:{page}"
+        )])
+
+        await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup(rows))
+
+    async def _start_expense_edit(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        gid: int,
+        eid: int,
+        page: int,
+    ) -> None:
+        """Re-run the add-expense wizard over an existing expense.
+
+        Editing an amount without redoing the split would leave the shares
+        adding up to the old total, so the whole thing is entered again —
+        prefilled, and saved back onto the same expense.
+        """
+        item = self.repo.get_expense(eid, gid)
+        if item is None:
+            await self._edit_or_send(update, "Трата не найдена.")
+            return
+
+        currency = self.repo.group_currency(gid)
+        _set_ae(ctx, {
+            "group_id": gid,
+            "expense_id": eid,
+            "page": page,
+            "amount_cents": 0,
+            "description": "",
+            "payer": 0,
+            "participants": {},
+            "split_mode": "",
+            "custom_left": [],
+            "custom_shares": {},
+            "currency": currency,
+            "orig_currency": "",
+            "orig_amount_cents": 0,
+            "step": "await_amount_desc",
+        })
+        current = format_cents(item["amount_cents"], currency)
+        await update.effective_chat.send_message(
+            f"Меняем трату #{eid}. Сейчас: {item['desc']} — {current}.\n"
+            f"Пришлите новую сумму и описание одним сообщением"
+            f" (валюта группы — {currency}).",
+            reply_markup=inline_cancel(),
+        )
+
+    async def _flow_receipt(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Attach a photo the user sent to the expense they picked."""
+        target = _get_receipt(ctx)
+        message = update.effective_message
+        photos = getattr(message, "photo", None)
+        if not photos:
+            await update.effective_chat.send_message(
+                "Пришлите фото чека одной картинкой или нажмите /cancel."
+            )
+            return
+
+        gid, eid = target["group_id"], target["expense_id"]
+        if not self.repo.can_edit_expense(eid, gid, update.effective_user.id):
+            _del_receipt(ctx)
+            await update.effective_chat.send_message(
+                "Чек может приложить только тот, кто добавил трату.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        # The last entry is the largest rendition Telegram kept.
+        self.repo.set_receipt(eid, gid, photos[-1].file_id)
+        _del_receipt(ctx)
+        await update.effective_chat.send_message(
+            f"Чек приложен к трате #{eid}.", reply_markup=main_keyboard()
+        )
+        await self._send_expense_card(update, ctx, gid, eid, target.get("page", 0))
 
     async def _send_members_page(
         self, update: Update, gid: int, page: int
@@ -2241,6 +3670,24 @@ class App:
             role_mark = " 👑 владелец" if m["role"] == "owner" else ""
             lines.append(f"• {m['name']}{role_mark}\n")
 
+        rows = []
+        if self.repo.is_group_owner(gid, update.effective_user.id):
+            currency = self.repo.group_currency(gid)
+            for m in members[start:end]:
+                if m["id"] == update.effective_user.id:
+                    continue
+                balance = self.repo.member_balance(gid, m["id"])
+                if balance:
+                    rows.append([InlineKeyboardButton(
+                        f"{m['name']}: {format_cents(balance, currency)} — не удалить",
+                        callback_data=f"memnote|{gid}|p:{page}",
+                    )])
+                else:
+                    rows.append([InlineKeyboardButton(
+                        f"🚫 Удалить {m['name']}",
+                        callback_data=f"memdel|{m['id']}|gid:{gid}|p:{page}",
+                    )])
+
         nav = [InlineKeyboardButton("Назад к группе", callback_data=f"mgsel|{gid}")]
         if page > 0:
             nav.insert(0, InlineKeyboardButton(
@@ -2250,8 +3697,9 @@ class App:
             nav.append(InlineKeyboardButton(
                 "Вперёд »", callback_data=f"members|{gid}|p:{page + 1}"
             ))
+        rows.append(nav)
 
-        await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup([nav]))
+        await self._edit_or_send(update, "".join(lines), InlineKeyboardMarkup(rows))
 
     async def _send_settlements_page(
         self, update: Update, gid: int, page: int
@@ -2274,12 +3722,18 @@ class App:
             )
             return
 
+        viewer_tz = self.repo.user_tz(update.effective_user.id)
+        currency = self.repo.group_currency(gid)
+        names = self.repo.names_for(
+            {i["from"] for i in items} | {i["to"] for i in items}
+        )
         lines = [f"Платежи группы #{gid} (страница {page + 1}):\n"]
         for item in items:
+            status = "" if item["confirmed"] else " — ждёт подтверждения"
             lines.append(
-                f"• #{item['id']} {self.repo.user_name(item['from'])} → "
-                f"{self.repo.user_name(item['to'])}: {format_cents(item['amount_cents'])}"
-                f" ({format_time(item['created_at'])})\n"
+                f"• #{item['id']} {names[item['from']]} → "
+                f"{names[item['to']]}: {format_cents(item['amount_cents'], currency)}"
+                f" ({format_time(item['created_at'], viewer_tz)}){status}\n"
             )
 
         rows = []
@@ -2404,34 +3858,69 @@ class App:
             await self._edit_or_send(update, "Участник не найден в группе. Начните заново.")
             return
 
-        try:
-            expense_id = self.repo.create_expense(
-                group_id,
-                uid,
-                st["payer"],
-                st["description"],
-                st["amount_cents"],
-                shares,
+        editing = st.get("expense_id") or 0
+        if editing and not self.repo.can_edit_expense(editing, group_id, uid):
+            _del_ae(ctx)
+            await self._edit_or_send(
+                update, "Менять трату может только тот, кто её добавил."
             )
-        except Exception as e:
-            logger.exception("failed to create expense")
-            await self._edit_or_send(update, f"Ошибка создания траты: {e}")
             return
 
+        try:
+            if editing:
+                self.repo.update_expense(
+                    editing,
+                    group_id,
+                    st["payer"],
+                    st["description"],
+                    st["amount_cents"],
+                    shares,
+                    orig_currency=st.get("orig_currency", ""),
+                    orig_amount_cents=st.get("orig_amount_cents", 0),
+                )
+                expense_id = editing
+            else:
+                expense_id = self.repo.create_expense(
+                    group_id,
+                    uid,
+                    st["payer"],
+                    st["description"],
+                    st["amount_cents"],
+                    shares,
+                    orig_currency=st.get("orig_currency", ""),
+                    orig_amount_cents=st.get("orig_amount_cents", 0),
+                )
+        except Exception as e:
+            logger.exception("failed to save expense")
+            await self._edit_or_send(update, f"Ошибка сохранения траты: {e}")
+            return
+
+        page = st.get("page", 0)
         _del_ae(ctx)
 
         # Notify other participants of their share
         expense_shares = self.repo.get_expense_shares(expense_id)
         title = self.repo.get_group_title(group_id)
+        base = st.get("currency") or self.repo.group_currency(group_id)
+        paid_in = ""
+        if st.get("orig_currency"):
+            paid_in = (
+                f" (оплачено"
+                f" {format_cents(st['orig_amount_cents'], st['orig_currency'])})"
+            )
+        # An edit moves money between people just as an new expense does,
+        # so everyone it touches hears about it.
+        verb = "изменена трата" if editing else "добавлена трата"
         for pid, share in expense_shares.items():
             if pid == uid:
                 continue
             try:
                 await ctx.bot.send_message(
                     pid,
-                    f"В группе #{group_id} ({title}) добавлена трата:"
-                    f" {st['description']} — {format_cents(st['amount_cents'])}.\n"
-                    f"Ваша доля: {format_cents(share)}."
+                    f"В группе #{group_id} ({title}) {verb} #{expense_id}:"
+                    f" {st['description']} —"
+                    f" {format_cents(st['amount_cents'], base)}{paid_in}.\n"
+                    f"Ваша доля: {format_cents(share, base)}."
                     f" Плательщик: {self.repo.user_name(st['payer'])}.",
                 )
             except Exception:
@@ -2439,14 +3928,18 @@ class App:
 
         await self._edit_or_send(
             update,
-            f"Трата #{expense_id} добавлена."
-            f" Сумма {format_cents(st['amount_cents'])},"
+            f"Трата #{expense_id} {'изменена' if editing else 'добавлена'}."
+            f" Сумма {format_cents(st['amount_cents'], base)}{paid_in},"
             f" плательщик {self.repo.user_name(st['payer'])}.",
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                "Открыть трату",
+                callback_data=f"expcard|{expense_id}|gid:{group_id}|p:{page}",
+            )]]),
         )
 
     # ---------- Balance screens ----------
 
-    def _debt_block(self, uid: int, entry: dict) -> str:
+    def _debt_block(self, entry: dict) -> str:
         """Per-group detail under one counterparty, so the net is not a
         black box: it shows which group each part came from."""
         parts = []
@@ -2458,6 +3951,16 @@ class App:
             parts.append(f"    #{gid} {title}: {side} {format_cents(abs(delta))}\n")
         return "".join(parts)
 
+    def _pending_lines(self, uid: int, pending: list[dict], names: dict) -> list[str]:
+        lines = []
+        for info in pending:
+            amount = format_cents(info["amount_cents"], info["currency"])
+            if info["from"] == uid:
+                lines.append(f"• вы → {names[info['to']]}: {amount} — ждём подтверждения\n")
+            else:
+                lines.append(f"• {names[info['from']]} → вам: {amount} — подтвердите получение\n")
+        return lines
+
     async def _show_debts(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -2468,55 +3971,138 @@ class App:
             )
             return
 
-        debts = self.repo.compute_user_debts(uid)
-        entries = sorted(
-            debts.items(), key=lambda kv: self.repo.user_name(kv[0]).lower()
+        # Walking every group of every counterparty is the slowest thing the
+        # bot does, and it blocks the event loop for everyone else.
+        debts = await asyncio.to_thread(self.repo.compute_user_debts, uid)
+        pending = self.repo.list_pending_settlements(uid)
+        names = self.repo.names_for(
+            set(debts) | {i["from"] for i in pending} | {i["to"] for i in pending}
         )
 
         you_owe, owe_you, even = [], [], []
-        for other, entry in entries:
-            detail = self._debt_block(uid, entry)
-            if not detail:
-                continue
-            name = self.repo.user_name(other)
-            net = entry["net"]
-            if net < 0:
-                you_owe.append((other, -net, name, detail))
-            elif net > 0:
-                owe_you.append((other, net, name, detail))
-            else:
-                even.append((other, name, detail))
+        for other, per_currency in debts.items():
+            name = names[other]
+            for currency, entry in sorted(per_currency.items()):
+                detail = self._debt_block(entry)
+                if not detail:
+                    continue
+                net = entry["net"]
+                if net < 0:
+                    you_owe.append((other, currency, -net, name, detail))
+                elif net > 0:
+                    owe_you.append((other, currency, net, name, detail))
+                else:
+                    even.append((other, currency, name, detail))
+        you_owe.sort(key=lambda row: (row[3].lower(), row[1]))
+        owe_you.sort(key=lambda row: (row[3].lower(), row[1]))
+        even.sort(key=lambda row: (row[2].lower(), row[1]))
+
+        # A claim already sent must not be offered again, or the same money
+        # gets "paid" twice while the first request is still open.
+        awaiting = {
+            (info["to"] if info["from"] == uid else info["from"], info["currency"])
+            for info in pending
+        }
 
         lines = ["💰 Долги по всем группам\n"]
-        if not you_owe and not owe_you and not even:
+        if not you_owe and not owe_you and not even and not pending:
             lines.append("\nДолгов нет 🎉")
         if you_owe:
             lines.append("\nВы должны:\n")
-            for _, amount, name, detail in you_owe:
-                lines.append(f"• {name} — {format_cents(amount)}\n{detail}")
+            for _, currency, amount, name, detail in you_owe:
+                lines.append(f"• {name} — {format_cents(amount, currency)}\n{detail}")
         if owe_you:
             lines.append("\nВам должны:\n")
-            for _, amount, name, detail in owe_you:
-                lines.append(f"• {name} — {format_cents(amount)}\n{detail}")
+            for _, currency, amount, name, detail in owe_you:
+                lines.append(f"• {name} — {format_cents(amount, currency)}\n{detail}")
         if even:
             lines.append("\nВы в расчёте (долги погасили друг друга):\n")
-            for _, name, detail in even:
-                lines.append(f"• {name}\n{detail}")
+            for _, currency, name, detail in even:
+                lines.append(f"• {name} ({currency})\n{detail}")
+        if pending:
+            lines.append("\nОжидают подтверждения:\n")
+            lines.extend(self._pending_lines(uid, pending, names))
 
         rows = []
-        for other, amount, name, _ in you_owe:
+        for info in pending:
+            if info["to"] == uid:
+                amount = format_cents(info["amount_cents"], info["currency"])
+                rows.append([
+                    InlineKeyboardButton(
+                        f"✅ Получил(а) от {names[info['from']]}: {amount}",
+                        callback_data=f"paycfm|{info['batch']}",
+                    ),
+                ])
+                rows.append([
+                    InlineKeyboardButton(
+                        f"❌ Не получал(а) от {names[info['from']]}",
+                        callback_data=f"payrej|{info['batch']}",
+                    ),
+                ])
+            else:
+                rows.append([InlineKeyboardButton(
+                    f"↩️ Отменить запрос к {names[info['to']]}",
+                    callback_data=f"payrej|{info['batch']}",
+                )])
+
+        for other, currency, amount, name, _ in you_owe:
+            if (other, currency) in awaiting:
+                continue
             rows.append([InlineKeyboardButton(
-                f"Оплатил(а) {name}: {format_cents(amount)}",
-                callback_data=f"paynet|to:{other}|amt:{amount}",
+                f"Оплатил(а) {name}: {format_cents(amount, currency)}",
+                callback_data=f"paynet|to:{other}|cur:{currency}|amt:{amount}",
             )])
-        for other, name, _ in even:
             rows.append([InlineKeyboardButton(
-                f"✅ Закрыть расчёты с {name}",
-                callback_data=f"paynet|to:{other}|amt:0",
+                f"Отдал(а) часть {name} ({currency})",
+                callback_data=f"paypart|to:{other}|cur:{currency}",
+            )])
+        for other, currency, name, _ in even:
+            if (other, currency) in awaiting:
+                continue
+            rows.append([InlineKeyboardButton(
+                f"✅ Закрыть расчёты с {name} ({currency})",
+                callback_data=f"paynet|to:{other}|cur:{currency}|amt:0",
             )])
 
         markup = InlineKeyboardMarkup(rows) if rows else None
         await self._edit_or_send(update, "".join(lines), markup)
+
+    async def _request_payment(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        other: int,
+        currency: str,
+        amount: int,
+    ) -> bool:
+        """Send a payment claim to the person who is owed the money."""
+        uid = update.effective_user.id
+        batch = self.repo.request_settlement(uid, other, currency, amount)
+        if not batch:
+            return False
+
+        from_name = self.repo.user_name(uid)
+        shown = format_cents(amount, currency)
+        if amount > 0:
+            text = (
+                f"{from_name} отметил(а), что отдал(а) вам {shown}.\n"
+                "Подтвердите, что деньги получены — до этого долг остаётся."
+            )
+        else:
+            text = (
+                f"{from_name} предлагает закрыть взаимные расчёты ({currency}):"
+                " долги погасили друг друга, переводить нечего.\n"
+                "Подтвердите, если согласны."
+            )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Подтверждаю", callback_data=f"paycfm|{batch}")],
+            [InlineKeyboardButton("❌ Не получал(а)", callback_data=f"payrej|{batch}")],
+        ])
+        try:
+            await ctx.bot.send_message(other, text, reply_markup=markup)
+        except Exception:
+            logger.info("failed to notify %s about a payment claim", other)
+        return True
 
 # ---------- Entry point ----------
 
@@ -2534,24 +4120,33 @@ def main() -> None:
         bot_app.base = me.username
         logger.info("Starting bot @%s …", me.username)
 
+    # Wizard state lives in user_data, so without persistence a restart in
+    # the middle of adding an expense leaves the user answering questions
+    # nobody is listening to any more.
+    state_path = os.environ.get("STATE_PATH", "./bot_state.pickle")
     application = (
         Application.builder()
         .token(token)
         .post_init(post_init)
+        .persistence(PicklePersistence(filepath=state_path))
         .build()
     )
 
     application.add_handler(CommandHandler("start", bot_app.on_start))
     application.add_handler(CommandHandler("join", bot_app.on_join))
     application.add_handler(CommandHandler("cancel", bot_app.on_cancel))
+    application.add_handler(CommandHandler("tz", bot_app.on_tz))
     application.add_handler(CallbackQueryHandler(bot_app.on_callback))
     # Use filters.TEXT (not ~filters.COMMAND) so that /join_<code> and
     # /start_<code> text patterns reach on_text; specific commands above
     # are consumed first within the same handler group.
+    application.add_handler(MessageHandler(filters.PHOTO, bot_app.on_photo))
     application.add_handler(MessageHandler(filters.TEXT, bot_app.on_text))
 
     try:
-        application.run_polling(drop_pending_updates=True)
+        # Money is involved: an expense someone sent while the bot was down
+        # should still land, not vanish.
+        application.run_polling(drop_pending_updates=False)
     finally:
         repo.close()
 

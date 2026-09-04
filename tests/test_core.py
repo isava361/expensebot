@@ -122,6 +122,11 @@ class RepoTest(unittest.TestCase):
             self.assertEqual(row["created_by_tg_id"], 1)
             repo.close()
 
+    def settle(self, repo, uid, other, amount, currency="RUB"):
+        """The full flow: the payer claims, the person owed confirms."""
+        batch = repo.request_settlement(uid, other, currency, amount)
+        return bool(batch) and repo.confirm_settlement(batch, other)
+
     def test_expense_delete_rights_use_creator(self):
         repo, gid = self.make_repo()
         expense_id = repo.create_expense(gid, 2, 1, "hotel", 900, {1: 300, 2: 300, 3: 300})
@@ -136,9 +141,9 @@ class RepoTest(unittest.TestCase):
         repo.create_expense(gid, 2, 1, "hotel", 1000, {1: 500, 2: 500})
 
         self.assertEqual(repo.compute_group_balances(gid), {(2, 1): 500})
-        self.assertTrue(repo.settle_with_user(2, 1, 500))
+        self.assertTrue(self.settle(repo, 2, 1, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
-        self.assertFalse(repo.settle_with_user(2, 1, 500))
+        self.assertFalse(self.settle(repo, 2, 1, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
 
     def test_chained_debts_are_simplified_across_the_group(self):
@@ -161,8 +166,8 @@ class RepoTest(unittest.TestCase):
         repo.create_expense(gid, 3, 3, "кофе", 1000, {2: 500, 3: 500})
 
         self.assertEqual(repo.compute_group_balances(gid), {(1, 3): 500})
-        self.assertFalse(repo.settle_with_user(1, 2, 500))
-        self.assertTrue(repo.settle_with_user(1, 3, 500))
+        self.assertFalse(self.settle(repo, 1, 2, 500))
+        self.assertTrue(self.settle(repo, 1, 3, 500))
         self.assertEqual(repo.compute_group_balances(gid), {})
 
     def make_two_groups(self):
@@ -184,12 +189,12 @@ class RepoTest(unittest.TestCase):
         self.assertEqual(repo.compute_group_balances(g2), {(2, 1): 500})
 
         debts = repo.compute_user_debts(1)
-        self.assertEqual(debts[2]["net"], 0)
-        self.assertEqual(debts[2]["by_group"], {g1: -500, g2: 500})
+        self.assertEqual(debts[2]["RUB"]["net"], 0)
+        self.assertEqual(debts[2]["RUB"]["by_group"], {g1: -500, g2: 500})
 
         # Nothing to transfer, but closing the books clears both groups.
-        self.assertFalse(repo.settle_with_user(1, 2, 500))
-        self.assertTrue(repo.settle_with_user(1, 2, 0))
+        self.assertFalse(self.settle(repo, 1, 2, 500))
+        self.assertTrue(self.settle(repo, 1, 2, 0))
         self.assertEqual(repo.compute_group_balances(g1), {})
         self.assertEqual(repo.compute_group_balances(g2), {})
         self.assertEqual(repo.compute_user_debts(1), {})
@@ -200,9 +205,9 @@ class RepoTest(unittest.TestCase):
         repo.create_expense(g1, 2, 2, "бензин", 1000, {1: 500, 2: 500})
         repo.create_expense(g2, 1, 1, "интернет", 400, {1: 200, 2: 200})
 
-        self.assertEqual(repo.compute_user_debts(1)[2]["net"], -300)
-        self.assertFalse(repo.settle_with_user(1, 2, 500))
-        self.assertTrue(repo.settle_with_user(1, 2, 300))
+        self.assertEqual(repo.compute_user_debts(1)[2]["RUB"]["net"], -300)
+        self.assertFalse(self.settle(repo, 1, 2, 500))
+        self.assertTrue(self.settle(repo, 1, 2, 300))
         self.assertEqual(repo.compute_user_debts(1), {})
         self.assertEqual(repo.compute_group_balances(g1), {})
         self.assertEqual(repo.compute_group_balances(g2), {})
@@ -219,15 +224,15 @@ class RepoTest(unittest.TestCase):
         repo.create_expense(g_b, 1, 1, "такси", 1000, {1: 500, 4: 500})
 
         debts = repo.compute_user_debts(1)
-        self.assertEqual(debts[2]["net"], -500)
-        self.assertEqual(debts[4]["net"], 500)
+        self.assertEqual(debts[2]["RUB"]["net"], -500)
+        self.assertEqual(debts[4]["RUB"]["net"], 500)
         self.assertNotIn(4, repo.compute_user_debts(2))
         self.assertNotIn(2, repo.compute_user_debts(4))
 
     def test_settlement_history_and_cancel(self):
         repo, gid = self.make_repo()
         repo.create_expense(gid, 2, 1, "hotel", 1000, {1: 500, 2: 500})
-        self.assertTrue(repo.settle_with_user(2, 1, 500))
+        self.assertTrue(self.settle(repo, 2, 1, 500))
 
         items = repo.list_group_settlements(gid, 10, 0)
         self.assertEqual(len(items), 1)
@@ -415,7 +420,8 @@ class ExportTest(unittest.TestCase):
 
     def test_balances_add_up_to_zero_and_match_the_bot(self):
         repo, gid = self.make_repo()
-        repo.settle_with_user(3, 1, 50000)
+        batch = repo.request_settlement(3, 1, "RUB", 50000)
+        repo.confirm_settlement(batch, 1)
         book = self.sheets(main.build_group_workbook(repo.export_group(gid)))
 
         by_name = {row[0]: row for row in book["Итоги по людям"][1:]}
