@@ -18,6 +18,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -221,6 +223,220 @@ def settle_net(net: dict[int, int]) -> dict[tuple[int, int], int]:
 
 
 # ---------- Repo ----------
+
+# ---------- XLSX writing ----------
+#
+# The export has to open in Excel, so it is a real .xlsx: a zip holding the
+# handful of XML parts a spreadsheet needs. Writing them here keeps the bot
+# on its single dependency, and the file only ever carries text and numbers,
+# which is the easy end of the format.
+
+_XLSX_DEFAULT_STYLE = 0
+_XLSX_HEADER_STYLE = 1
+_XLSX_MONEY_STYLE = 2
+
+# XML 1.0 cannot carry these at all, and descriptions are user input.
+_XLSX_BAD_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_SHEET_NAME_BAD_CHARS = re.compile(r"[\[\]:*?/\\]")
+
+
+class Money:
+    """A cents amount that lands in the sheet as a number Excel can sum.
+
+    Written as text it would be a string in the column, and the whole point
+    of the export is that people can add the numbers up themselves.
+    """
+
+    __slots__ = ("cents",)
+
+    def __init__(self, cents: int) -> None:
+        self.cents = cents
+
+
+def _xml_text(value: str) -> str:
+    return html.escape(_XLSX_BAD_CHARS.sub("", value), quote=False)
+
+
+def _col_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA."""
+    name = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(ord("A") + rem) + name
+    return name
+
+
+def _cell_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Money):
+        return format_cents(value.cents)
+    return str(value)
+
+
+def _cell_xml(ref: str, value, style: int) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, Money):
+        return f'<c r="{ref}" s="{_XLSX_MONEY_STYLE}"><v>{format_cents(value.cents)}</v></c>'
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f'<c r="{ref}" s="{style}"><v>{value}</v></c>'
+    return (
+        f'<c r="{ref}" t="inlineStr" s="{style}">'
+        f'<is><t xml:space="preserve">{_xml_text(str(value))}</t></is></c>'
+    )
+
+
+def _sheet_xml(header: list, rows: list[list]) -> str:
+    all_rows = ([header] if header else []) + rows
+    ncols = max((len(r) for r in all_rows), default=1) or 1
+
+    widths = []
+    for c in range(ncols):
+        longest = max((len(_cell_text(r[c])) for r in all_rows if c < len(r)), default=0)
+        widths.append(min(max(longest + 2, 9), 46))
+    cols = "".join(
+        f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>'
+        for i, w in enumerate(widths)
+    )
+
+    body = []
+    for r_index, row in enumerate(all_rows, start=1):
+        style = _XLSX_HEADER_STYLE if header and r_index == 1 else _XLSX_DEFAULT_STYLE
+        cells = "".join(
+            _cell_xml(f"{_col_letter(c)}{r_index}", value, style)
+            for c, value in enumerate(row)
+        )
+        body.append(f'<row r="{r_index}">{cells}</row>')
+
+    # Keep the header on screen while scrolling through a long trip.
+    pane = (
+        '<sheetViews><sheetView workbookViewId="0">'
+        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        "</sheetView></sheetViews>"
+    ) if header else ""
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"{pane}<cols>{cols}</cols>"
+        f"<sheetData>{''.join(body)}</sheetData></worksheet>"
+    )
+
+
+_XLSX_STYLES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    '<numFmts count="1"><numFmt numFmtId="164" formatCode="0.00"/></numFmts>'
+    '<fonts count="2">'
+    '<font><sz val="11"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="11"/><name val="Calibri"/></font>'
+    "</fonts>"
+    # Excel insists these two fills exist before any of its own.
+    '<fills count="2">'
+    '<fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    "</fills>"
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="3">'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+    "</cellXfs>"
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    "</styleSheet>"
+)
+
+
+def _sheet_name(name: str, index: int) -> str:
+    cleaned = _SHEET_NAME_BAD_CHARS.sub(" ", name).strip()[:31]
+    return cleaned or f"Лист{index}"
+
+
+def build_xlsx(sheets: list[tuple[str, list, list[list]]]) -> bytes:
+    """Pack ``(name, header, rows)`` triples into an .xlsx file.
+
+    Cells are ``str``, ``int``, ``Money`` or ``None``.
+    """
+    if not sheets:
+        raise ValueError("a workbook needs at least one sheet")
+
+    parts: dict[str, str] = {}
+    sheet_files = []
+    for i, (name, header, rows) in enumerate(sheets, start=1):
+        path = f"xl/worksheets/sheet{i}.xml"
+        parts[path] = _sheet_xml(header, rows)
+        sheet_files.append((_sheet_name(name, i), i, path))
+
+    content_types = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels"'
+        ' ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml"'
+        ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml"'
+        ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+    ]
+    for _, _, path in sheet_files:
+        content_types.append(
+            f'<Override PartName="/{path}"'
+            ' ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+    content_types.append("</Types>")
+    parts["[Content_Types].xml"] = "".join(content_types)
+
+    parts["_rels/.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1"'
+        ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"'
+        ' Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+
+    parts["xl/workbook.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        "<sheets>"
+        + "".join(
+            f'<sheet name="{_xml_text(name)}" sheetId="{i}" r:id="rId{i}"/>'
+            for name, i, _ in sheet_files
+        )
+        + "</sheets></workbook>"
+    )
+
+    styles_rid = len(sheet_files) + 1
+    parts["xl/_rels/workbook.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}"'
+            ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"'
+            f' Target="worksheets/sheet{i}.xml"/>'
+            for _, i, _ in sheet_files
+        )
+        + f'<Relationship Id="rId{styles_rid}"'
+        ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"'
+        ' Target="styles.xml"/>'
+        "</Relationships>"
+    )
+
+    parts["xl/styles.xml"] = _XLSX_STYLES
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, text in parts.items():
+            # A fixed timestamp keeps identical data producing identical bytes.
+            info = zipfile.ZipInfo(path, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, text.encode("utf-8"))
+    return buf.getvalue()
+
 
 class Repo:
     def __init__(self, db_path: str):
@@ -692,6 +908,286 @@ class Repo:
                 (settlement_id, group_id),
             )
             self._conn.commit()
+
+    # -- export --
+
+    def export_group(self, group_id: int) -> dict:
+        """Every row a member would need to re-check the group's maths.
+
+        Deleted expenses are left out: they do not affect any debt, so
+        showing them would only invite people to add them back in by hand.
+        """
+        with self._lock:
+            expense_rows = self._conn.execute(
+                "SELECT id, payer_tg_id, created_by_tg_id, description,"
+                " amount_cents, created_at"
+                " FROM expenses WHERE group_id=? AND deleted=0"
+                " ORDER BY created_at, id",
+                (group_id,),
+            ).fetchall()
+            share_rows = self._conn.execute(
+                "SELECT p.expense_id, p.participant_tg_id, p.share_cents"
+                " FROM expense_participants p"
+                " JOIN expenses e ON e.id = p.expense_id"
+                " WHERE e.group_id=? AND e.deleted=0",
+                (group_id,),
+            ).fetchall()
+            settlement_rows = self._conn.execute(
+                "SELECT id, from_tg_id, to_tg_id, amount_cents,"
+                " confirmed_by_to, created_at"
+                " FROM settlements WHERE group_id=? ORDER BY created_at, id",
+                (group_id,),
+            ).fetchall()
+
+        shares: dict[int, dict[int, int]] = {}
+        for r in share_rows:
+            shares.setdefault(r["expense_id"], {})[r["participant_tg_id"]] = r["share_cents"]
+
+        expenses = [
+            {
+                "id": r["id"],
+                "payer": r["payer_tg_id"],
+                "created_by": r["created_by_tg_id"],
+                "desc": r["description"],
+                "amount_cents": r["amount_cents"],
+                "created_at": r["created_at"],
+                "shares": shares.get(r["id"], {}),
+            }
+            for r in expense_rows
+        ]
+        settlements = [
+            {
+                "id": r["id"],
+                "from": r["from_tg_id"],
+                "to": r["to_tg_id"],
+                "amount_cents": r["amount_cents"],
+                "counted": bool(r["confirmed_by_to"]),
+                "created_at": r["created_at"],
+            }
+            for r in settlement_rows
+        ]
+
+        members = self.list_members_detailed(group_id)
+        names = {m["id"]: m["name"] for m in members}
+        for e in expenses:
+            for uid in [e["payer"], e["created_by"], *e["shares"]]:
+                if uid and uid not in names:
+                    names[uid] = self.user_name(uid)
+        for s in settlements:
+            for uid in (s["from"], s["to"]):
+                if uid not in names:
+                    names[uid] = self.user_name(uid)
+
+        return {
+            "group_id": group_id,
+            "title": self.get_group_title(group_id),
+            "members": members,
+            "names": names,
+            "expenses": expenses,
+            "settlements": settlements,
+            "balances": self.compute_group_balances(group_id),
+        }
+
+
+# ---------- Group report ----------
+#
+# The point of the export is that nobody has to trust the bot: every number
+# it derives is shown next to the raw rows it came from, so a member can
+# redo the arithmetic by hand and land on the same debts.
+
+_EXPORT_SLUG_RE = re.compile(r"[^\w-]+", re.UNICODE)
+
+
+def export_filename(group_id: int, title: str) -> str:
+    slug = _EXPORT_SLUG_RE.sub("-", title).strip("-")[:40].strip("-")
+    parts = [f"group-{group_id}", slug, time.strftime("%Y-%m-%d")]
+    return "-".join(p for p in parts if p) + ".xlsx"
+
+
+def _expenses_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]]:
+    """One row per expense, one share column per person.
+
+    Reading across a row shows who paid and how the amount was cut up;
+    reading down a person's column gives everything they consumed. The two
+    totals at the bottom are what the balances sheet starts from.
+    """
+    names = data["names"]
+    header = [
+        "№", "Дата", "Описание", "Сумма", "Сумма долей",
+        "Кто платил", "Кто добавил",
+    ] + [f"Доля: {names[uid]}" for uid in order]
+
+    rows: list[list] = []
+    total = 0
+    share_totals = {uid: 0 for uid in order}
+    for e in data["expenses"]:
+        shares = e["shares"]
+        total += e["amount_cents"]
+        for uid, cents in shares.items():
+            share_totals[uid] = share_totals.get(uid, 0) + cents
+        rows.append(
+            [
+                e["id"],
+                format_time(e["created_at"]),
+                e["desc"],
+                Money(e["amount_cents"]),
+                Money(sum(shares.values())),
+                names[e["payer"]],
+                names[e["created_by"]] if e["created_by"] else "",
+            ]
+            + [Money(shares[uid]) if uid in shares else None for uid in order]
+        )
+
+    rows.append(
+        ["", "", "ИТОГО", Money(total), Money(sum(share_totals.values())), "", ""]
+        + [Money(share_totals.get(uid, 0)) for uid in order]
+    )
+    return ("Траты", header, rows)
+
+
+def _totals_sheet(data: dict, order: list[int]) -> tuple[str, list, list[list]]:
+    """Each person's four raw numbers and the balance they add up to.
+
+    The balance column has to sum to zero: every rouble one person is short
+    is a rouble another is up.
+    """
+    names = data["names"]
+    paid = {uid: 0 for uid in order}
+    consumed = {uid: 0 for uid in order}
+    sent = {uid: 0 for uid in order}
+    received = {uid: 0 for uid in order}
+
+    for e in data["expenses"]:
+        paid[e["payer"]] = paid.get(e["payer"], 0) + e["amount_cents"]
+        for uid, cents in e["shares"].items():
+            consumed[uid] = consumed.get(uid, 0) + cents
+    for s in data["settlements"]:
+        if not s["counted"]:
+            continue
+        sent[s["from"]] = sent.get(s["from"], 0) + s["amount_cents"]
+        received[s["to"]] = received.get(s["to"], 0) + s["amount_cents"]
+
+    header = [
+        "Участник", "Оплатил", "Его доля", "Отдал по расчётам",
+        "Получил по расчётам", "Баланс", "Итог",
+    ]
+    rows: list[list] = []
+    totals = [0, 0, 0, 0, 0]
+    for uid in order:
+        balance = paid[uid] - consumed[uid] + sent[uid] - received[uid]
+        if balance > 0:
+            verdict = f"должны вернуть {format_cents(balance)}"
+        elif balance < 0:
+            verdict = f"должен(на) {format_cents(-balance)}"
+        else:
+            verdict = "в расчёте"
+        rows.append([
+            names[uid],
+            Money(paid[uid]),
+            Money(consumed[uid]),
+            Money(sent[uid]),
+            Money(received[uid]),
+            Money(balance),
+            verdict,
+        ])
+        for i, value in enumerate(
+            (paid[uid], consumed[uid], sent[uid], received[uid], balance)
+        ):
+            totals[i] += value
+
+    rows.append(["ИТОГО"] + [Money(v) for v in totals] + ["сумма балансов = 0"])
+    return ("Итоги по людям", header, rows)
+
+
+def _transfers_sheet(data: dict) -> tuple[str, list, list[list]]:
+    names = data["names"]
+    header = ["Должник", "Получатель", "Сумма"]
+    rows = [
+        [names[frm], names[to], Money(amount)]
+        for (frm, to), amount in sorted(
+            data["balances"].items(),
+            key=lambda kv: (names[kv[0][0]].lower(), names[kv[0][1]].lower()),
+        )
+    ]
+    if not rows:
+        rows.append(["Все в расчёте", "", ""])
+    return ("Кто кому платит", header, rows)
+
+
+def _settlements_sheet(data: dict) -> tuple[str, list, list[list]]:
+    names = data["names"]
+    header = ["№", "Дата", "Кто отдал", "Кому", "Сумма", "Учтён в расчётах"]
+    rows = [
+        [
+            s["id"],
+            format_time(s["created_at"]),
+            names[s["from"]],
+            names[s["to"]],
+            Money(s["amount_cents"]),
+            "да" if s["counted"] else "нет",
+        ]
+        for s in data["settlements"]
+    ]
+    if not rows:
+        rows.append(["", "", "Платежей ещё не было", "", "", ""])
+    return ("Платежи", header, rows)
+
+
+def _howto_sheet(data: dict) -> tuple[str, list, list[list]]:
+    return (
+        "Как проверить",
+        ["Как проверить расчёт вручную"],
+        [[line] for line in [
+            f"Группа #{data['group_id']}: {data['title']}",
+            f"Выгружено: {format_time(now_unix())}",
+            "",
+            "Лист «Траты» — исходные данные, по одной строке на трату.",
+            "  Плательщик отдал всю сумму, а колонки «Доля: …» показывают,",
+            "  за кого эта сумма была потрачена.",
+            "  «Сумма долей» в каждой строке обязана совпадать с «Суммой».",
+            "",
+            "Лист «Итоги по людям» — по каждому человеку:",
+            "  Баланс = Оплатил − Его доля + Отдал по расчётам − Получил по расчётам.",
+            "  Плюс — человеку должны, минус — должен он.",
+            "  Сумма всех балансов всегда равна нулю.",
+            "",
+            "Лист «Кто кому платит» — те же балансы, сведённые в минимум переводов:",
+            "  если А должен Б, а Б должен В, бот убирает Б и просит А платить В.",
+            "  Итоговые суммы у каждого человека при этом не меняются.",
+            "",
+            "Лист «Платежи» — уже проведённые расчёты между людьми.",
+            "  Они уменьшают долг и попадают в колонки «Отдал/Получил по расчётам».",
+            "",
+            "Удалённые траты в выгрузку не попадают: они не участвуют и в долгах.",
+            "Суммы указаны в тех же единицах, что и в боте.",
+        ]],
+    )
+
+
+def build_group_workbook(data: dict) -> bytes:
+    """Render one group's ledger as an .xlsx workbook."""
+    # Members first, in the order the bot shows them, then anyone who appears
+    # only in old rows — a name must never silently drop a share.
+    order = [m["id"] for m in data["members"]]
+    seen = set(order)
+    for e in data["expenses"]:
+        for uid in [e["payer"], e["created_by"], *e["shares"]]:
+            if uid and uid not in seen:
+                seen.add(uid)
+                order.append(uid)
+    for s in data["settlements"]:
+        for uid in (s["from"], s["to"]):
+            if uid not in seen:
+                seen.add(uid)
+                order.append(uid)
+
+    return build_xlsx([
+        _expenses_sheet(data, order),
+        _totals_sheet(data, order),
+        _transfers_sheet(data),
+        _settlements_sheet(data),
+        _howto_sheet(data),
+    ])
 
 
 # ---------- Keyboards ----------
@@ -1235,6 +1731,16 @@ class App:
             await query.answer("Группа выбрана")
             return
 
+        # Excel export of everything the group's debts are computed from
+        if data.startswith("xlsx|"):
+            gid = int(data[len("xlsx|"):])
+            if not self.repo.is_group_member(gid, uid):
+                await query.answer("Нет доступа", show_alert=True)
+                return
+            await query.answer("Готовлю файл…")
+            await self._send_group_workbook(update, gid)
+            return
+
         # Expense list pagination
         if data.startswith("explist|"):
             parts = data.split("|")
@@ -1568,6 +2074,7 @@ class App:
                 InlineKeyboardButton("👥 Участники", callback_data=f"members|{gid}|p:0"),
                 InlineKeyboardButton("🔗 Поделиться /join…", url=share),
             ],
+            [InlineKeyboardButton("📊 Выгрузить в Excel", callback_data=f"xlsx|{gid}")],
         ]
         if self.repo.is_group_owner(gid, uid):
             rows.append([InlineKeyboardButton(
@@ -1613,6 +2120,46 @@ class App:
             await update.callback_query.message.edit_text(text, **opts)
         else:
             await update.effective_chat.send_message(text, **opts)
+
+    async def _send_group_workbook(self, update: Update, gid: int) -> None:
+        """Hand the whole group ledger over as a spreadsheet.
+
+        People check a split by laying the numbers out and adding them up,
+        so the file carries the raw traces and shares, not just the debts
+        the bot arrived at.
+        """
+        try:
+            data = self.repo.export_group(gid)
+        except Exception:
+            logger.exception("failed to load export for group %s", gid)
+            await update.effective_chat.send_message("Не удалось собрать выгрузку.")
+            return
+
+        if not data["expenses"] and not data["settlements"]:
+            await update.effective_chat.send_message(
+                "В группе пока нет трат — выгружать нечего."
+            )
+            return
+
+        try:
+            content = build_group_workbook(data)
+        except Exception:
+            logger.exception("failed to build workbook for group %s", gid)
+            await update.effective_chat.send_message("Не удалось собрать выгрузку.")
+            return
+
+        title = data["title"] or str(gid)
+        await update.effective_chat.send_document(
+            document=BytesIO(content),
+            filename=export_filename(gid, title),
+            caption=(
+                f"Траты группы #{gid}: {title}\n"
+                "«Траты» — все траты с долями каждого, «Итоги по людям» —"
+                " сколько кто внёс и потратил, «Кто кому платит» — итоговые"
+                " переводы. Как всё сходится, объяснено на листе"
+                " «Как проверить»."
+            ),
+        )
 
     async def _send_expenses_page(
         self,

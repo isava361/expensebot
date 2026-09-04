@@ -16,6 +16,9 @@ Python Telegram bot for splitting group expenses with SQLite storage.
 - Idempotent payment confirmation from inline buttons.
 - Payment history with cancellation by payer or group owner.
 - Expense deletion by the user who created the expense.
+- Excel export per group: every expense with each person's share, the
+  per-person totals the debts are derived from, and a sheet explaining how
+  to redo the arithmetic by hand.
 - SQLite migrations in `migrations/`.
 
 ## Quick Start
@@ -67,6 +70,23 @@ A reply keyboard lives on the Telegram client until the bot sends a new one, so
 `KEYBOARD_VERSION` when `main_keyboard()` changes: users holding an older layout
 are sent the new one on their next message, and labels from retired keyboards
 stay routed (`_LEGACY_DEBT_BUTTONS`) so the buttons still on their screen work.
+
+## Excel Export
+
+«📊 Выгрузить в Excel» on a group screen sends an `.xlsx` with five sheets:
+
+- `Траты` — one row per expense with a share column per member, so each row
+  shows how the amount was cut up and each column what one person consumed.
+- `Итоги по людям` — paid, consumed, settlements sent and received, and the
+  balance they add up to; the balance column always sums to zero.
+- `Кто кому платит` — the same balances as the minimum set of transfers.
+- `Платежи` — settlements already recorded.
+- `Как проверить` — the formulas above in words.
+
+The file is written by `build_xlsx()` in `main.py`: a zip of the few
+SpreadsheetML parts Excel needs, so the export adds no dependency. Amounts are
+written as numbers with a `0.00` format — not text — so columns can be summed
+in the spreadsheet. Deleted expenses are excluded, as they are from the debts.
 
 ## Tests
 

@@ -1,8 +1,11 @@
 import asyncio
+import io
 import sqlite3
 import tempfile
 import types
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import main
@@ -11,20 +14,35 @@ import main
 class FakeChat:
     def __init__(self):
         self.sent = []
+        self.documents = []
 
     async def send_message(self, text, reply_markup=None, **kwargs):
         self.sent.append((text, reply_markup))
 
+    async def send_document(self, document, filename=None, caption=None, **kwargs):
+        self.documents.append((document, filename, caption))
+
+
+class FakeQuery:
+    """A pressed inline button: it only has to answer and carry its data."""
+
+    def __init__(self, data):
+        self.data = data
+        self.message = None
+        self.answers = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text or "", show_alert))
+
 
 class FakeUpdate:
-    callback_query = None
-
-    def __init__(self, uid, text):
+    def __init__(self, uid, text, callback_data=None):
         self.effective_user = types.SimpleNamespace(
             id=uid, username=f"u{uid}", first_name="U", last_name=None
         )
         self.effective_chat = FakeChat()
         self.effective_message = types.SimpleNamespace(text=text)
+        self.callback_query = FakeQuery(callback_data) if callback_data else None
 
 
 class AmountParserTest(unittest.TestCase):
@@ -300,6 +318,158 @@ class KeyboardTest(unittest.TestCase):
             self.assertTrue(repo._column_exists("users", "keyboard_version"))
             self.assertTrue(repo.has_stale_keyboard(1))
             repo.close()
+
+
+class ExportTest(unittest.TestCase):
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+    def make_repo(self):
+        repo = main.Repo(":memory:")
+        repo.upsert_user(1, "@ivan")
+        repo.upsert_user(2, "@olya")
+        repo.upsert_user(3, "@petr")
+        gid, code = repo.create_group("Поездка", 1)
+        repo.join_by_code(code, 2)
+        repo.join_by_code(code, 3)
+        # 1 pays for everyone, 2 pays for a dinner without 3.
+        repo.create_expense(gid, 1, 1, "такси", 150000, {1: 50000, 2: 50000, 3: 50000})
+        repo.create_expense(gid, 2, 2, 'ужин "У моря" & вино', 90000, {1: 45000, 2: 45000})
+        return repo, gid
+
+    def col_index(self, letters: str) -> int:
+        index = 0
+        for ch in letters:
+            index = index * 26 + (ord(ch) - ord("A") + 1)
+        return index - 1
+
+    def sheets(self, blob):
+        """Read the workbook back as {sheet name: [[cell, …], …]}.
+
+        Parsed straight from the XML so the test needs no Excel library and
+        fails if the file stops being well-formed.
+        """
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+        book = ET.fromstring(archive.read("xl/workbook.xml"))
+        rels = {
+            r.get("Id"): r.get("Target")
+            for r in ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        }
+        rid = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+        result = {}
+        for sheet in book.iter(f"{self.NS}sheet"):
+            part = "xl/" + rels[sheet.get(rid)]
+            rows = []
+            for row in ET.fromstring(archive.read(part)).iter(f"{self.NS}row"):
+                cells = {}
+                for c in row.iter(f"{self.NS}c"):
+                    column = "".join(ch for ch in c.get("r") if ch.isalpha())
+                    if c.get("t") == "inlineStr":
+                        cells[column] = c.find(f"{self.NS}is/{self.NS}t").text
+                    else:
+                        cells[column] = float(c.find(f"{self.NS}v").text)
+                last = max((self.col_index(col) for col in cells), default=-1)
+                rows.append([cells.get(main._col_letter(i)) for i in range(last + 1)])
+            # Empty cells are left out of the file, so pad the short rows back
+            # to a rectangle and let the tests index columns directly.
+            width = max((len(r) for r in rows), default=0)
+            result[sheet.get("name")] = [r + [None] * (width - len(r)) for r in rows]
+        return result
+
+    def test_file_is_a_workbook_with_every_screen(self):
+        repo, gid = self.make_repo()
+        blob = main.build_group_workbook(repo.export_group(gid))
+
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+        self.assertIsNone(archive.testzip())
+        for part in ["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
+                     "xl/_rels/workbook.xml.rels", "xl/styles.xml"]:
+            self.assertIn(part, archive.namelist())
+        for part in archive.namelist():
+            ET.fromstring(archive.read(part))  # every part is well-formed XML
+
+        self.assertEqual(
+            list(self.sheets(blob)),
+            ["Траты", "Итоги по людям", "Кто кому платит", "Платежи",
+             "Как проверить"],
+        )
+
+    def test_every_expense_lands_with_its_shares(self):
+        repo, gid = self.make_repo()
+        rows = self.sheets(main.build_group_workbook(repo.export_group(gid)))["Траты"]
+
+        header, taxi, dinner, totals = rows
+        self.assertEqual(header[:5], ["№", "Дата", "Описание", "Сумма", "Сумма долей"])
+        self.assertEqual(header[7:], ["Доля: @ivan", "Доля: @olya", "Доля: @petr"])
+
+        # Amounts are numbers, not text, or nobody can sum the column.
+        self.assertEqual(taxi[2:5], ["такси", 1500.0, 1500.0])
+        self.assertEqual(taxi[7:], [500.0, 500.0, 500.0])
+        # Quotes and ampersands survive the XML escaping.
+        self.assertEqual(dinner[2:5], ['ужин "У моря" & вино', 900.0, 900.0])
+        # 3 was not at the dinner, so their cell stays empty rather than 0.
+        self.assertEqual(dinner[7:], [450.0, 450.0, None])
+
+        self.assertEqual(totals[2:5], ["ИТОГО", 2400.0, 2400.0])
+        self.assertEqual(totals[7:], [950.0, 950.0, 500.0])
+
+    def test_balances_add_up_to_zero_and_match_the_bot(self):
+        repo, gid = self.make_repo()
+        repo.settle_with_user(3, 1, 50000)
+        book = self.sheets(main.build_group_workbook(repo.export_group(gid)))
+
+        by_name = {row[0]: row for row in book["Итоги по людям"][1:]}
+        # paid − share + sent − received, the formula the sheet explains.
+        self.assertEqual(by_name["@ivan"][1:6], [1500.0, 950.0, 0.0, 500.0, 50.0])
+        self.assertEqual(by_name["@olya"][1:6], [900.0, 950.0, 0.0, 0.0, -50.0])
+        self.assertEqual(by_name["@petr"][1:6], [0.0, 500.0, 500.0, 0.0, 0.0])
+        self.assertEqual(by_name["ИТОГО"][5], 0.0)
+
+        transfers = book["Кто кому платит"][1:]
+        self.assertEqual(transfers, [["@olya", "@ivan", 50.0]])
+        self.assertEqual(
+            repo.compute_group_balances(gid), {(2, 1): 5000}
+        )
+
+        payments = book["Платежи"][1:]
+        self.assertEqual([p[2:] for p in payments], [["@petr", "@ivan", 500.0, "да"]])
+
+    def test_deleted_expenses_stay_out_of_the_export(self):
+        repo, gid = self.make_repo()
+        eid = repo.create_expense(gid, 3, 3, "отменённая", 30000, {1: 10000, 2: 10000, 3: 10000})
+        repo.delete_expense(eid)
+
+        rows = self.sheets(main.build_group_workbook(repo.export_group(gid)))["Траты"]
+        self.assertNotIn("отменённая", [r[2] for r in rows])
+        self.assertEqual(rows[-1][3], 2400.0)
+
+    def test_button_sends_the_file_to_a_member_only(self):
+        repo, gid = self.make_repo()
+        app = main.App(repo, "bot")
+
+        update = FakeUpdate(2, "", callback_data=f"xlsx|{gid}")
+        asyncio.run(app.on_callback(update, types.SimpleNamespace(user_data={}, bot=None)))
+        (document, filename, caption), = update.effective_chat.documents
+        self.assertTrue(filename.endswith(".xlsx"), filename)
+        self.assertIn("Поездка", filename)
+        self.assertIn(f"#{gid}", caption)
+        self.assertEqual(document.getvalue()[:2], b"PK")
+
+        outsider = FakeUpdate(9, "", callback_data=f"xlsx|{gid}")
+        asyncio.run(app.on_callback(outsider, types.SimpleNamespace(user_data={}, bot=None)))
+        self.assertEqual(outsider.effective_chat.documents, [])
+        self.assertIn("Нет доступа", outsider.callback_query.answers[0][0])
+
+    def test_empty_group_says_so_instead_of_sending_a_file(self):
+        repo = main.Repo(":memory:")
+        repo.upsert_user(1, "@ivan")
+        gid, _ = repo.create_group("Пустая", 1)
+        app = main.App(repo, "bot")
+
+        update = FakeUpdate(1, "", callback_data=f"xlsx|{gid}")
+        asyncio.run(app.on_callback(update, types.SimpleNamespace(user_data={}, bot=None)))
+        self.assertEqual(update.effective_chat.documents, [])
+        self.assertIn("нет трат", update.effective_chat.sent[-1][0])
 
 
 if __name__ == "__main__":
