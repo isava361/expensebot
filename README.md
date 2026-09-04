@@ -5,8 +5,9 @@ Python Telegram bot for splitting group expenses with SQLite storage.
 ## Features
 
 - Groups with invite links and join codes.
-- One base currency per group; an expense paid in another currency keeps what
-  was actually handed over, next to the rate it worked out to.
+- One base currency per group; an expense paid in another currency is
+  converted at the day's rate, keeps what was actually handed over, and the
+  rate can be replaced with the amount the bank really took.
 - Expense wizard with inline buttons: payer, participants, equal/custom split.
 - Fast participant selection: all, me and payer, clear.
 - An expense card with the full split, the receipt photo, and edit/delete.
@@ -56,9 +57,14 @@ Optional environment variables:
 
 - `DB_PATH`: SQLite database path, defaults to `./data.db`.
 - `STATE_PATH`: wizard state file, defaults to `./bot_state.pickle`.
-- `DEFAULT_CURRENCY`: base currency for new groups, defaults to `RUB`.
+- `DEFAULT_CURRENCY`: base currency for new groups, defaults to `RUB`;
+  an unrecognised code falls back to `RUB` rather than being stored.
 - `DEFAULT_TZ_OFFSET`: time zone new users start with, e.g. `+03:00`,
   defaults to UTC.
+- `RATES_URL`: exchange-rate endpoint with a `{base}` placeholder, defaults
+  to `https://open.er-api.com/v6/latest/{base}`. Set it empty to turn
+  automatic conversion off and always ask for the amount.
+- `RATES_TTL`: seconds a fetched rate table is reused, defaults to 21600.
 
 Commands: `/start`, `/join <код>`, `/cancel`, `/tz <смещение>`.
 
@@ -97,9 +103,28 @@ Every group has one base currency (`groups.currency`). All of
 `expenses.amount_cents`, the settlements and every balance are in it, so the
 arithmetic never has to guess a rate.
 
-An expense paid in another currency is entered as `100 EUR ужин`; the bot then
-asks what left the payer's account in the group's currency and stores both
-(`orig_currency`, `orig_amount_cents`). The rate is derived for display only.
+An amount with no currency on it is simply in the group's currency — that is
+the everyday case and it asks nothing extra. An expense paid in another
+currency is entered as `100 EUR ужин`; the bot converts it at the day's rate
+and shows what it got:
+
+```
+100.00 EUR ≈ 10075.57 RUB
+Курс: 1 EUR = 100.7557 RUB (на 2026-09-04 03:02)
+Если банк списал другую сумму — пришлите её числом.
+```
+
+Sending a number replaces the converted amount — the others will check the
+split against a bank statement, and a card rate with its spread is rarely the
+market one. Both figures are stored (`orig_currency`, `orig_amount_cents`
+alongside `amount_cents`); the rate itself is not, it is derived from the pair
+for display.
+
+Rates come from `open.er-api.com` (no key, updated daily) and are cached per
+base currency for `RATES_TTL`. Every lookup is best-effort: if the provider is
+unreachable, slow or does not know the currency, the bot falls back to asking
+for the amount, so nothing about adding an expense depends on the network
+beyond Telegram itself.
 
 Debts are computed per currency and never netted across them — a debt in lira
 is not repaid by a credit in roubles. The currency can only be changed while

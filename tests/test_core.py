@@ -26,6 +26,23 @@ class FakeBot:
         self.sent.append((chat_id, text, reply_markup))
 
 
+class FakeRates(main.Rates):
+    """The real caching and arithmetic over a fixed rate table."""
+
+    def __init__(self, table=None, ttl=3600, fail=False):
+        super().__init__(url="https://rates.invalid/{base}", ttl=ttl)
+        # As the provider reports it: how much of each currency one base buys.
+        self.table = table if table is not None else {"RUB": {"EUR": 0.01, "TRY": 0.5}}
+        self.fail = fail
+        self.fetches = 0
+
+    async def _fetch(self, base):
+        self.fetches += 1
+        if self.fail:
+            raise RuntimeError("provider is down")
+        return self.table[base], 1609459200  # 2021-01-01 00:00 UTC
+
+
 class FakeChat:
     def __init__(self):
         self.sent = []
@@ -655,6 +672,45 @@ class CurrencyTest(unittest.TestCase):
             main.split_amount_currency_desc("1200 обед"), ("1200", "", "обед")
         )
 
+    def test_a_new_group_is_in_roubles(self):
+        repo = main.Repo(":memory:")
+        repo.upsert_user(1, "@ivan")
+        gid, _ = repo.create_group("Сочи", 1)
+        self.assertEqual(repo.group_currency(gid), "RUB")
+
+    def test_a_broken_default_still_lands_on_roubles(self):
+        """An unknown code would otherwise be stamped on the group and label
+        every amount in it with something meaningless."""
+        original = main.DEFAULT_CURRENCY
+        main.DEFAULT_CURRENCY = "ЛОЛ"
+        try:
+            repo = main.Repo(":memory:")
+            repo.upsert_user(1, "@ivan")
+            gid, _ = repo.create_group("Сочи", 1)
+            self.assertEqual(repo.group_currency(gid), "RUB")
+        finally:
+            main.DEFAULT_CURRENCY = original
+
+    def test_an_amount_without_a_currency_uses_the_group_one(self):
+        repo, _, gid_tr = self.make_repo()
+        app = main.App(repo, "bot")
+        ctx = types.SimpleNamespace(user_data={}, bot=FakeBot())
+
+        asyncio.run(app.on_callback(
+            FakeUpdate(1, "", callback_data=f"aesel|{gid_tr}"), ctx
+        ))
+        asked = FakeUpdate(1, "1500 такси")
+        asyncio.run(app.on_text(asked, ctx))
+        # No follow-up question about a rate: the amount is already in TRY.
+        self.assertIn("1500.00 TRY", asked.effective_chat.sent[-1][0])
+
+        for data in ["payer|1", "part_all", "part_done", "split|equal"]:
+            asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=data), ctx))
+
+        expense = repo.list_group_expenses(gid_tr, 5, 0)[0]
+        self.assertEqual(expense["amount_cents"], 150000)
+        self.assertEqual(expense["orig_currency"], "")
+
     def test_debts_in_different_currencies_never_cancel(self):
         repo, gid_ru, gid_tr = self.make_repo()
         # 2 owes 1 in roubles, 1 owes 2 the same number of lira.
@@ -959,9 +1015,10 @@ class ExpenseEditTest(unittest.TestCase):
         asyncio.run(app.on_photo(FakeUpdate(2, "", photo=["small", "big"]), ctx))
         self.assertEqual(repo.get_expense(eid, gid)["receipt"], "big")
 
-    def test_foreign_currency_wizard_asks_for_the_amount_in_group_money(self):
+    def test_wizard_asks_for_the_amount_when_no_rate_is_available(self):
         repo, gid, _ = self.make_repo()
-        app = main.App(repo, "bot")
+        # Rates switched off entirely, as RATES_URL="" does in production.
+        app = main.App(repo, "bot", rates=main.Rates(url=""))
         ctx = types.SimpleNamespace(user_data={}, bot=FakeBot())
 
         asyncio.run(app.on_callback(
@@ -1064,6 +1121,121 @@ class GroupAdminTest(unittest.TestCase):
         asyncio.run(app.on_callback(update, ctx))
         self.assertIn("закройте долги", update.callback_query.answers[-1][0])
         self.assertTrue(repo.is_group_member(gid, 2))
+
+
+class RatesTest(unittest.TestCase):
+    def convert(self, rates, amount, orig="EUR", base="RUB"):
+        return asyncio.run(rates.convert(amount, orig, base))
+
+    def test_amount_is_converted_at_the_days_rate(self):
+        rates = FakeRates()
+        # One rouble buys 0.01 EUR, so one EUR costs 100 roubles.
+        self.assertEqual(self.convert(rates, 10000), (1000000, 100.0, 1609459200))
+        self.assertEqual(self.convert(rates, 10000, "TRY"), (20000, 2.0, 1609459200))
+
+    def test_rounding_lands_on_whole_cents(self):
+        rates = FakeRates({"RUB": {"EUR": 0.0123}})
+        cents, rate, _ = self.convert(rates, 10000)
+        self.assertEqual(cents, round(10000 / 0.0123))
+        self.assertAlmostEqual(rate, 1 / 0.0123)
+
+    def test_currencies_the_provider_skips_are_left_to_the_user(self):
+        rates = FakeRates()
+        self.assertIsNone(self.convert(rates, 10000, "AMD"))
+        self.assertIsNone(self.convert(rates, 10000, "RUB"))  # nothing to convert
+        self.assertIsNone(self.convert(rates, 0))
+
+    def test_a_broken_provider_never_breaks_the_wizard(self):
+        """The rate is a convenience; the expense has to be enterable without it."""
+        self.assertIsNone(self.convert(FakeRates(fail=True), 10000))
+        self.assertIsNone(self.convert(main.Rates(url=""), 10000))
+
+    def test_absurd_results_are_refused(self):
+        rates = FakeRates({"RUB": {"EUR": 0.0000000001}})
+        self.assertIsNone(self.convert(rates, 10000))
+
+    def test_rates_are_fetched_once_per_ttl(self):
+        rates = FakeRates()
+        for _ in range(3):
+            self.convert(rates, 10000)
+        self.assertEqual(rates.fetches, 1)
+
+        expired = FakeRates(ttl=1)
+        self.convert(expired, 10000)
+        expired._cache["RUB"] = (main.now_unix() - 60, *expired._cache["RUB"][1:])
+        self.convert(expired, 10000)
+        self.assertEqual(expired.fetches, 2)
+
+
+class ConversionFlowTest(unittest.TestCase):
+    def setup(self, **kwargs):
+        repo = main.Repo(":memory:")
+        repo.upsert_user(1, "@ivan")
+        repo.upsert_user(2, "@olya")
+        gid, code = repo.create_group("Рим", 1)
+        repo.join_by_code(code, 2)
+        app = main.App(repo, "bot", rates=FakeRates(**kwargs))
+        return repo, gid, app, types.SimpleNamespace(user_data={}, bot=FakeBot())
+
+    def finish(self, app, ctx):
+        for data in ["payer|1", "part_all", "part_done", "split|equal"]:
+            asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=data), ctx))
+
+    def test_the_rate_is_offered_and_can_be_accepted(self):
+        repo, gid, app, ctx = self.setup()
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=f"aesel|{gid}"), ctx))
+
+        offer = FakeUpdate(1, "100 EUR ужин")
+        asyncio.run(app.on_text(offer, ctx))
+        text = offer.effective_chat.sent[-1][0]
+        self.assertIn("100.00 EUR ≈ 10000.00 RUB", text)
+        self.assertIn("1 EUR = 100.0000 RUB", text)
+
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data="rateok"), ctx))
+        self.finish(app, ctx)
+
+        expense = repo.list_group_expenses(gid, 5, 0)[0]
+        self.assertEqual(expense["amount_cents"], 1000000)
+        self.assertEqual(expense["orig_currency"], "EUR")
+        self.assertEqual(expense["orig_amount_cents"], 10000)
+
+    def test_the_bank_amount_wins_over_the_rate(self):
+        """The others check the split against a bank statement, not a feed."""
+        repo, gid, app, ctx = self.setup()
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=f"aesel|{gid}"), ctx))
+        asyncio.run(app.on_text(FakeUpdate(1, "100 EUR ужин"), ctx))
+
+        corrected = FakeUpdate(1, "10500")
+        asyncio.run(app.on_text(corrected, ctx))
+        self.assertIn("100.00 EUR = 10500.00 RUB", corrected.effective_chat.sent[-2][0])
+        self.finish(app, ctx)
+
+        expense = repo.list_group_expenses(gid, 5, 0)[0]
+        self.assertEqual(expense["amount_cents"], 1050000)
+        self.assertEqual(expense["orig_amount_cents"], 10000)
+
+    def test_a_dead_provider_falls_back_to_asking(self):
+        repo, gid, app, ctx = self.setup(fail=True)
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=f"aesel|{gid}"), ctx))
+
+        asked = FakeUpdate(1, "100 EUR ужин")
+        asyncio.run(app.on_text(asked, ctx))
+        self.assertIn("Не знаю курс EUR к RUB", asked.effective_chat.sent[-1][0])
+
+        asyncio.run(app.on_text(FakeUpdate(1, "9800"), ctx))
+        self.finish(app, ctx)
+        self.assertEqual(repo.list_group_expenses(gid, 5, 0)[0]["amount_cents"], 980000)
+
+    def test_a_stale_accept_button_does_not_fire(self):
+        repo, gid, app, ctx = self.setup()
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=f"aesel|{gid}"), ctx))
+        asyncio.run(app.on_text(FakeUpdate(1, "100 EUR ужин"), ctx))
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data="cancel_flow"), ctx))
+
+        stale = FakeUpdate(1, "", callback_data="rateok")
+        asyncio.run(app.on_callback(stale, ctx))
+        self.assertIn("закрыт", stale.callback_query.answers[-1][0])
+        self.assertEqual(repo.count_group_expenses(gid), 0)
 
 
 if __name__ == "__main__":

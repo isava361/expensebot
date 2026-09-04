@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
+import httpx
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -62,7 +64,8 @@ MESSAGE_LIMIT = 3900
 KEYBOARD_VERSION = 1
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 # Base currency a new group starts with; changeable while the group is empty.
-DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", "RUB").strip().upper()
+BASE_CURRENCY = "RUB"
+DEFAULT_CURRENCY = os.environ.get("DEFAULT_CURRENCY", BASE_CURRENCY).strip().upper()
 # Offset new users start with, e.g. "+03:00". Everyone can change it with /tz.
 DEFAULT_TZ_OFFSET = os.environ.get("DEFAULT_TZ_OFFSET", "0")
 
@@ -236,6 +239,20 @@ def tz_label(offset_min: int) -> str:
     sign = "-" if offset_min < 0 else "+"
     hours, minutes = divmod(abs(offset_min), 60)
     return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def default_currency() -> str:
+    """The currency a new group starts in.
+
+    Falls back to roubles rather than storing whatever the environment
+    happens to hold: an unknown code would end up on the group as its base
+    currency, labelling every amount in it with something meaningless.
+    """
+    code = normalize_currency(DEFAULT_CURRENCY)
+    if not code:
+        logger.warning("bad DEFAULT_CURRENCY %r, using %s", DEFAULT_CURRENCY, BASE_CURRENCY)
+        return BASE_CURRENCY
+    return code
 
 
 def default_tz_offset_min() -> int:
@@ -573,6 +590,83 @@ def build_xlsx(sheets: list[tuple[str, list, list[list]]]) -> bytes:
     return buf.getvalue()
 
 
+# ---------- Exchange rates ----------
+#
+# open.er-api.com is free, needs no key and covers every currency the bot
+# knows. Rates there move once a day, so one fetch per base currency serves
+# everybody for hours.
+#
+# Every lookup is best-effort. A rate is a starting point, not the truth: the
+# number that actually matters is what the payer's bank took, so a failed
+# fetch simply falls back to asking them, and an automatic rate can always be
+# overridden with the real amount.
+RATES_URL = os.environ.get("RATES_URL", "https://open.er-api.com/v6/latest/{base}")
+RATES_TTL = int(os.environ.get("RATES_TTL", "21600"))  # 6 hours
+RATES_TIMEOUT = 5.0
+
+
+class Rates:
+    """Daily exchange rates, cached per base currency."""
+
+    def __init__(self, url: Optional[str] = None, ttl: int = 0):
+        self._url = RATES_URL if url is None else url
+        self._ttl = ttl or RATES_TTL
+        # base -> (fetched_at, {currency: units per one base}, provider's date)
+        self._cache: dict[str, tuple[int, dict, int]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _fetch(self, base: str) -> tuple[dict, int]:
+        async with httpx.AsyncClient(timeout=RATES_TIMEOUT) as client:
+            response = await client.get(self._url.format(base=base))
+            response.raise_for_status()
+            payload = response.json()
+        if payload.get("result") not in (None, "success"):
+            raise ValueError(f"rate provider returned {payload.get('result')!r}")
+        rates = payload.get("rates") or {}
+        if not rates:
+            raise ValueError("rate provider returned no rates")
+        return rates, int(payload.get("time_last_update_unix") or now_unix())
+
+    async def _rates_for(self, base: str) -> tuple[dict, int]:
+        cached = self._cache.get(base)
+        if cached and now_unix() - cached[0] < self._ttl:
+            return cached[1], cached[2]
+        async with self._lock:
+            # Somebody may have fetched while this call waited for the lock;
+            # without the second look a busy moment fires one request per user.
+            cached = self._cache.get(base)
+            if cached and now_unix() - cached[0] < self._ttl:
+                return cached[1], cached[2]
+            rates, updated = await self._fetch(base)
+            self._cache[base] = (now_unix(), rates, updated)
+            return rates, updated
+
+    async def convert(
+        self, amount_cents: int, orig: str, base: str
+    ) -> Optional[tuple[int, float, int]]:
+        """Convert ``orig`` into ``base``.
+
+        Returns ``(amount in base, base per one orig, rate date)``, or None
+        when there is no usable rate and the amount has to be asked for.
+        """
+        if not self._url or not orig or orig == base or amount_cents <= 0:
+            return None
+        try:
+            rates, updated = await self._rates_for(base)
+        except Exception as e:
+            logger.info("no exchange rate for %s->%s: %s", orig, base, e)
+            return None
+
+        per_base = rates.get(orig)  # how much `orig` one unit of `base` buys
+        if not isinstance(per_base, (int, float)) or per_base <= 0:
+            return None
+        rate = 1 / per_base
+        converted = int(amount_cents * rate + 0.5)
+        if converted <= 0 or converted > MAX_AMOUNT_CENTS:
+            return None
+        return converted, rate, updated
+
+
 class Repo:
     def __init__(self, db_path: str):
         self._lock = threading.RLock()
@@ -702,7 +796,7 @@ class Repo:
 
     def create_group(self, title: str, owner: int, currency: str = "") -> tuple[int, str]:
         code = rand_code()
-        currency = normalize_currency(currency) or DEFAULT_CURRENCY
+        currency = normalize_currency(currency) or default_currency()
         with self._lock:
             cur = self._conn.execute(
                 'INSERT INTO "groups"(title,owner_tg_id,invite_code,created_at,currency)'
@@ -783,7 +877,7 @@ class Repo:
             row = self._conn.execute(
                 'SELECT currency FROM "groups" WHERE id=?', (group_id,)
             ).fetchone()
-        return row["currency"] if row else DEFAULT_CURRENCY
+        return row["currency"] if row else default_currency()
 
     def group_titles(self, group_ids) -> dict[int, str]:
         """Titles for a screen that spans groups, in one query."""
@@ -1879,9 +1973,15 @@ _TOP_BUTTONS = {
 
 
 class App:
-    def __init__(self, repo: Repo, bot_username: str = ""):
+    def __init__(
+        self,
+        repo: Repo,
+        bot_username: str = "",
+        rates: Optional[Rates] = None,
+    ):
         self.repo = repo
         self.base = bot_username
+        self.rates = rates if rates is not None else Rates()
 
     def _best_name(self, user) -> str:
         if user.username:
@@ -2330,18 +2430,44 @@ class App:
             st["currency"] = base
             st["description"] = description or "Без описания"
 
-            # Paid in another currency: the group's ledger stays in one unit,
-            # so ask what actually left the payer's account instead of
-            # inventing a rate nobody agreed on.
+            # Paid in another currency: the group's ledger stays in one
+            # unit, so convert at the day's rate — and let the payer replace
+            # it with what their bank actually took, which is the number the
+            # others will be checking against.
             if currency and currency != base:
                 st["orig_currency"] = currency
                 st["orig_amount_cents"] = amt
-                st["step"] = "await_base_amount"
+                converted = await self.rates.convert(amt, currency, base)
+                if converted is None:
+                    st["step"] = "await_base_amount"
+                    _set_ae(ctx, st)
+                    await update.effective_chat.send_message(
+                        f"Не знаю курс {currency} к {base}."
+                        f" {format_cents(amt, currency)} — сколько это в {base}?"
+                        f" Пришлите сумму, которую с вас списали.",
+                        reply_markup=inline_cancel(),
+                    )
+                    return
+
+                cents, rate, updated = converted
+                st["amount_cents"] = cents
+                st["step"] = "confirm_rate"
                 _set_ae(ctx, st)
+                tz = self.repo.user_tz(update.effective_user.id)
                 await update.effective_chat.send_message(
-                    f"{format_cents(amt, currency)} — сколько это в {base}?"
-                    f" Пришлите сумму, которую с вас списали.",
-                    reply_markup=inline_cancel(),
+                    f"{format_cents(amt, currency)} ≈ {format_cents(cents, base)}\n"
+                    f"Курс: 1 {currency} = {rate:.4f} {base}"
+                    f" (на {format_time(updated, tz)})\n"
+                    f"Если банк списал другую сумму — пришлите её числом.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            f"✅ {format_cents(cents, base)} — дальше",
+                            callback_data="rateok",
+                        )],
+                        [InlineKeyboardButton(
+                            "❌ Отмена", callback_data="cancel_flow"
+                        )],
+                    ]),
                 )
                 return
 
@@ -2350,7 +2476,7 @@ class App:
             _set_ae(ctx, st)
             await self._ask_payer(update, ctx, st)
 
-        elif step == "await_base_amount":
+        elif step in ("await_base_amount", "confirm_rate"):
             base = st.get("currency") or self.repo.group_currency(st["group_id"])
             try:
                 amt = cents_from_str(txt.strip())
@@ -3022,12 +3148,27 @@ class App:
         # Add-expense flow callbacks
         st = _get_ae(ctx)
         if st is None:
-            await query.answer()
+            # The wizard is gone — cancelled, finished, or from an older
+            # session. Say so: the buttons are still on screen, and a tap
+            # that does nothing at all reads as a broken bot.
+            await query.answer("Мастер уже закрыт", show_alert=True)
             return
         group_id = st.get("group_id")
         if not self.repo.is_group_member(group_id, uid):
             _del_ae(ctx)
             await query.answer("Нет доступа", show_alert=True)
+            return
+
+        # Keep the rate the bot proposed
+        if data == "rateok":
+            st = _get_ae(ctx)
+            if st is None or st.get("step") != "confirm_rate":
+                await query.answer("Мастер уже закрыт", show_alert=True)
+                return
+            st["step"] = "choose_payer"
+            _set_ae(ctx, st)
+            await query.answer()
+            await self._ask_payer(update, ctx, st)
             return
 
         if data.startswith("payer|"):
