@@ -785,6 +785,19 @@ class Repo:
             ).fetchone()
         return row["currency"] if row else DEFAULT_CURRENCY
 
+    def group_titles(self, group_ids) -> dict[int, str]:
+        """Titles for a screen that spans groups, in one query."""
+        ids = list({int(i) for i in group_ids})
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            rows = self._conn.execute(
+                f'SELECT id, title FROM "groups" WHERE id IN ({placeholders})', ids
+            ).fetchall()
+        found = {r["id"]: r["title"] for r in rows}
+        return {gid: found.get(gid, "") for gid in ids}
+
     def group_currencies(self, group_ids) -> dict[int, str]:
         """One lookup for a screen that spans groups."""
         ids = list(group_ids)
@@ -848,6 +861,11 @@ class Repo:
     def member_balance(self, group_id: int, uid: int) -> int:
         """What this person is up or down in one group, in its currency."""
         return self._net_positions(group_id).get(uid, 0)
+
+    def member_balances(self, group_id: int) -> dict[int, int]:
+        """Everyone's balance at once: the members screen needs them all,
+        and each call walks every expense in the group."""
+        return self._net_positions(group_id)
 
     def remove_member(self, group_id: int, uid: int) -> str:
         """Take someone out of a group. Returns "" or why it cannot happen.
@@ -3673,10 +3691,11 @@ class App:
         rows = []
         if self.repo.is_group_owner(gid, update.effective_user.id):
             currency = self.repo.group_currency(gid)
+            balances = self.repo.member_balances(gid)
             for m in members[start:end]:
                 if m["id"] == update.effective_user.id:
                     continue
-                balance = self.repo.member_balance(gid, m["id"])
+                balance = balances.get(m["id"], 0)
                 if balance:
                     rows.append([InlineKeyboardButton(
                         f"{m['name']}: {format_cents(balance, currency)} — не удалить",
@@ -3773,8 +3792,15 @@ class App:
             for m in members
         ]
         btns.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel_flow")])
+        base = st.get("currency") or self.repo.group_currency(st["group_id"])
+        paid_in = ""
+        if st.get("orig_currency"):
+            paid_in = (
+                f" (оплачено"
+                f" {format_cents(st['orig_amount_cents'], st['orig_currency'])})"
+            )
         text = (
-            f"Сумма: {format_cents(st['amount_cents'])}\n"
+            f"Сумма: {format_cents(st['amount_cents'], base)}{paid_in}\n"
             f"Описание: {st['description']}\n"
             f"Выберите плательщика:"
         )
@@ -3939,14 +3965,14 @@ class App:
 
     # ---------- Balance screens ----------
 
-    def _debt_block(self, entry: dict) -> str:
+    def _debt_block(self, entry: dict, titles: dict) -> str:
         """Per-group detail under one counterparty, so the net is not a
         black box: it shows which group each part came from."""
         parts = []
         for gid, delta in sorted(entry["by_group"].items()):
             if delta == 0:
                 continue
-            title = self.repo.get_group_title(gid)
+            title = titles.get(gid, "")
             side = "вам" if delta > 0 else "вы"
             parts.append(f"    #{gid} {title}: {side} {format_cents(abs(delta))}\n")
         return "".join(parts)
@@ -3978,12 +4004,18 @@ class App:
         names = self.repo.names_for(
             set(debts) | {i["from"] for i in pending} | {i["to"] for i in pending}
         )
+        titles = self.repo.group_titles(
+            gid
+            for per_currency in debts.values()
+            for entry in per_currency.values()
+            for gid in entry["by_group"]
+        )
 
         you_owe, owe_you, even = [], [], []
         for other, per_currency in debts.items():
             name = names[other]
             for currency, entry in sorted(per_currency.items()):
-                detail = self._debt_block(entry)
+                detail = self._debt_block(entry, titles)
                 if not detail:
                     continue
                 net = entry["net"]
@@ -4137,10 +4169,10 @@ def main() -> None:
     application.add_handler(CommandHandler("cancel", bot_app.on_cancel))
     application.add_handler(CommandHandler("tz", bot_app.on_tz))
     application.add_handler(CallbackQueryHandler(bot_app.on_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, bot_app.on_photo))
     # Use filters.TEXT (not ~filters.COMMAND) so that /join_<code> and
     # /start_<code> text patterns reach on_text; specific commands above
     # are consumed first within the same handler group.
-    application.add_handler(MessageHandler(filters.PHOTO, bot_app.on_photo))
     application.add_handler(MessageHandler(filters.TEXT, bot_app.on_text))
 
     try:
