@@ -9,9 +9,13 @@ Python Telegram bot for splitting group expenses with SQLite storage.
   converted at the day's rate, keeps what was actually handed over, and the
   rate can be replaced with the amount the bank really took.
 - Expense wizard with inline buttons: payer, participants, equal/custom split.
+- A review card before every save, including edits: check the amount, payer
+  and shares, change them, or cancel without writing to the ledger.
 - Fast participant selection: all, me and payer, clear.
 - An expense card with the full split, the receipt photo, and edit/delete.
 - Expense editing and deletion by the user who created the expense.
+- Expense history with actor, time, and before/after values; deletion can be
+  undone from its confirmation or from the deleted-expenses list.
 - Receipt photos attached to an expense.
 - A single debts screen: one net figure per person per currency across every
   shared group, with the per-group breakdown that produced it.
@@ -28,6 +32,7 @@ Python Telegram bot for splitting group expenses with SQLite storage.
   to redo the arithmetic by hand.
 - Per-user time zone for every timestamp the bot shows.
 - SQLite migrations in `migrations/`.
+- Atomic writes and migrations, verified SQLite backups, and a restore command.
 
 ## Quick Start
 
@@ -65,6 +70,12 @@ Optional environment variables:
   to `https://open.er-api.com/v6/latest/{base}`. Set it empty to turn
   automatic conversion off and always ask for the amount.
 - `RATES_TTL`: seconds a fetched rate table is reused, defaults to 21600.
+- `BACKUP_DIR`: directory for automatic database snapshots; defaults to
+  `backups/` alongside `DB_PATH`. Use a separate disk or a backed-up directory
+  if the snapshots should also survive loss of the database disk.
+- `BACKUP_INTERVAL`: seconds between runtime snapshots, defaults to 86400
+  (one day), must be positive. An existing database is also backed up before
+  startup migrations; another snapshot starts when the bot connects.
 
 Commands: `/start`, `/join <код>`, `/cancel`, `/tz <смещение>`.
 
@@ -90,6 +101,33 @@ Important permission rules:
   left behind would exist for one side only.
 
 For old databases, migration `002_expense_created_by` backfills `created_by_tg_id` from `payer_tg_id`.
+
+## Reviewing and changing expenses
+
+Choosing equal shares or entering the last custom share opens a review card;
+only **Сохранить** changes balances or sends notifications. The card lets you
+change the amount/description, payer, participants or split. For the last
+custom share the bot offers the exact remainder as a button. A different
+entered amount is rejected rather than silently replaced.
+
+Every creation, edit, receipt change, deletion and restoration is recorded in
+`expense_history` in the same transaction as the expense. The expense card's
+**История изменений** shows who acted, when, and what changed, with pagination.
+History starts with this update: for older expenses their first new change
+captures the previous state, but earlier overwritten versions cannot be recovered.
+
+Deleting a single expense preserves its receipt and shares. Its author can
+undo deletion immediately or open **Траты → Удалённые траты** later and restore
+it. Other current group members can read the history. Restoring an expense
+requires its payer and participants to still belong to the group. Changing
+an old expense is also refused if it would recreate a balance for a departed
+member. Deleting an entire group still removes that group's expenses and history.
+
+Notifications for expense edits, deletion and restoration include everyone
+affected in either the old or new split, including both payers. Delivery is
+best-effort: a user who blocked the bot will not receive a notification.
+An edit started against an older revision is refused if the expense has
+changed meanwhile; reopen its card to edit the current version.
 
 ## Navigation
 
@@ -181,6 +219,13 @@ Paying the full net closes the debt in every shared group and in both
 directions. A smaller amount is spread over the groups where the payer owes,
 largest debt first, and leaves the rest standing.
 
+Pending requests and confirmation messages show the actual net transfer:
+1000 RUB owed in one group and 400 RUB owed in the reverse direction mean a
+600 RUB payment. Both ledger entries are still retained for correct group
+balances. New batches explicitly store the requester and recipient, including
+zero-net offsets. Older batches lack this metadata and infer direction from
+their ledger rows; for an old zero-net batch its original initiator is unknown.
+
 ## Excel Export
 
 «📊 Выгрузить в Excel» on a group screen sends an `.xlsx` with five sheets:
@@ -194,7 +239,7 @@ largest debt first, and leaves the rest standing.
 - `Платежи` — settlements, each marked confirmed or still awaiting confirmation.
 - `Как проверить` — the formulas above in words.
 
-The file is written by `build_xlsx()` in `main.py`: a zip of the few
+The file is written by `build_xlsx()` in `workbook.py`: a zip of the few
 SpreadsheetML parts Excel needs, so the export adds no dependency. Amounts are
 written as numbers with a `0.00` format — not text — so columns can be summed
 in the spreadsheet. Deleted expenses are excluded, as they are from the debts.
@@ -218,6 +263,60 @@ local time.
   would otherwise never arrive.
 - The two slow operations — computing debts across every group and building a
   workbook — run in a worker thread so they do not block other users.
+- Repository mutations roll back on errors, including failures while writing
+  shares or history. Amounts must be integer cents, positive and within limits;
+  shares must be nonnegative and add up exactly. Database triggers also reject
+  invalid individual expense/share amounts.
+- A unique draft operation ID prevents re-saving a persisted draft from
+  creating another expense. Save buttons are tied to the current review card.
+- Migration SQL and its version marker are committed together. A startup
+  backup failure prevents migration of an existing database. Runtime backup
+  failures are logged, and the next scheduled attempt still runs.
+
+## Backups and recovery
+
+Snapshots use SQLite's backup API, so committed data in WAL is included.
+Each completed snapshot passes `PRAGMA integrity_check` and a check for the
+bot's core tables. The tests also restore a snapshot and compare balances and
+history. Backups cover the ledger, users and history; the separate wizard
+state pickle and bot token are not included. Automatic snapshots are retained
+without pruning, so monitor the backup directory's disk usage.
+
+Create a backup without starting Telegram (uses `DB_PATH`):
+
+```powershell
+python main.py backup --output .\backups\manual.db
+```
+
+Restore to a **new** database file:
+
+```powershell
+python main.py restore --backup .\backups\manual.db --output .\recovered.db
+```
+
+Both commands refuse to overwrite an existing destination. Stop the bot before
+switching it to the restored file, then start with a new wizard-state path so
+drafts from a newer ledger cannot be applied accidentally:
+
+```powershell
+$env:DB_PATH = ".\recovered.db"
+$env:STATE_PATH = ".\recovered-state.pickle"
+python main.py
+```
+
+Keep the original database until the restored data has been checked. Startup
+migrations also work on restored databases from older versions.
+
+## Code layout
+
+- `main.py`: entry point, backup/restore CLI and runtime lifecycle; retains
+  imports used by the original tests and integrations.
+- `core.py`: money arithmetic, parsing, formatting and shared defaults.
+- `repository.py`: SQLite ledger, permissions, migrations and history.
+- `storage.py`: transaction wrapper, snapshot verification and restoration.
+- `handlers.py`: Telegram screens, expense wizard and notifications.
+- `rates.py`: cached currency conversion.
+- `workbook.py`: XLSX writer and group reports.
 
 ## Tests
 

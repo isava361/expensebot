@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 
 import main
+import core
 
 
 class FakePhoto:
@@ -682,15 +683,15 @@ class CurrencyTest(unittest.TestCase):
     def test_a_broken_default_still_lands_on_roubles(self):
         """An unknown code would otherwise be stamped on the group and label
         every amount in it with something meaningless."""
-        original = main.DEFAULT_CURRENCY
-        main.DEFAULT_CURRENCY = "ЛОЛ"
+        original = core.DEFAULT_CURRENCY
+        core.DEFAULT_CURRENCY = "ЛОЛ"
         try:
             repo = main.Repo(":memory:")
             repo.upsert_user(1, "@ivan")
             gid, _ = repo.create_group("Сочи", 1)
             self.assertEqual(repo.group_currency(gid), "RUB")
         finally:
-            main.DEFAULT_CURRENCY = original
+            core.DEFAULT_CURRENCY = original
 
     def test_an_amount_without_a_currency_uses_the_group_one(self):
         repo, _, gid_tr = self.make_repo()
@@ -707,6 +708,8 @@ class CurrencyTest(unittest.TestCase):
 
         for data in ["payer|1", "part_all", "part_done", "split|equal"]:
             asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=data), ctx))
+        token = ctx.user_data["add_expense"]["confirm_token"]
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=f"expsave|{token}"), ctx))
 
         expense = repo.list_group_expenses(gid_tr, 5, 0)[0]
         self.assertEqual(expense["amount_cents"], 150000)
@@ -992,6 +995,9 @@ class ExpenseEditTest(unittest.TestCase):
         asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data="part_all"), ctx))
         asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data="part_done"), ctx))
         asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data="split|equal"), ctx))
+        self.assertEqual(repo.get_expense(eid, gid)["amount_cents"], 30000)
+        token = ctx.user_data["add_expense"]["confirm_token"]
+        asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data=f"expsave|{token}"), ctx))
 
         item = repo.get_expense(eid, gid)
         self.assertEqual(item["desc"], "ужин с вином")
@@ -1034,6 +1040,8 @@ class ExpenseEditTest(unittest.TestCase):
         asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data="part_all"), ctx))
         asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data="part_done"), ctx))
         asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data="split|equal"), ctx))
+        token = ctx.user_data["add_expense"]["confirm_token"]
+        asyncio.run(app.on_callback(FakeUpdate(2, "", callback_data=f"expsave|{token}"), ctx))
 
         added = [e for e in repo.list_group_expenses(gid, 10, 0) if e["desc"] == "паром"]
         self.assertEqual(len(added), 1)
@@ -1181,6 +1189,8 @@ class ConversionFlowTest(unittest.TestCase):
     def finish(self, app, ctx):
         for data in ["payer|1", "part_all", "part_done", "split|equal"]:
             asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=data), ctx))
+        token = ctx.user_data["add_expense"]["confirm_token"]
+        asyncio.run(app.on_callback(FakeUpdate(1, "", callback_data=f"expsave|{token}"), ctx))
 
     def test_the_rate_is_offered_and_can_be_accepted(self):
         repo, gid, app, ctx = self.setup()
