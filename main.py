@@ -61,7 +61,7 @@ MAX_AMOUNT_CENTS = 1_000_000_000
 MESSAGE_LIMIT = 3900
 # Bump whenever main_keyboard() changes: a reply keyboard lives on the client
 # until the bot sends a new one, so users have to be pushed the new layout.
-KEYBOARD_VERSION = 1
+KEYBOARD_VERSION = 2
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 # Base currency a new group starts with; changeable while the group is empty.
 BASE_CURRENCY = "RUB"
@@ -1882,18 +1882,22 @@ def build_group_workbook(data: dict, tz: int = 0) -> bytes:
 # ---------- Keyboards ----------
 
 def main_keyboard() -> ReplyKeyboardMarkup:
-    # Ordered by how often each action is used: adding an expense is the
-    # everyday action and gets a full-width row, creating a group happens
-    # once per trip and sits last.
+    # The keyboard sits under every screen forever, so it holds only what is
+    # used daily. Inviting people is a second route to the group card, which
+    # already carries a share button; creating a group happens once per trip
+    # and lives on the group list instead.
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🧾 Добавить трату")],
             [KeyboardButton("💰 Долги"), KeyboardButton("👥 Мои группы")],
-            [KeyboardButton("🔗 Приглашение"), KeyboardButton("➕ Создать группу")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
+
+def new_group_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton("➕ Создать группу", callback_data="gnew")
 
 
 def inline_cancel() -> InlineKeyboardMarkup:
@@ -1965,11 +1969,11 @@ def _set_new_group(ctx: ContextTypes.DEFAULT_TYPE, v: bool) -> None:
 # Labels from keyboards the bot used to send. Clients keep showing them until
 # they receive a new keyboard, so they have to keep working.
 _LEGACY_DEBT_BUTTONS = {"📊 Балансы", "🔄 Взаимозачёт"}
+_LEGACY_GROUP_BUTTONS = {"🔗 Приглашение", "➕ Создать группу"}
 
 _TOP_BUTTONS = {
-    "➕ Создать группу", "👥 Мои группы", "🔗 Приглашение",
-    "🧾 Добавить трату", "💰 Долги",
-} | _LEGACY_DEBT_BUTTONS
+    "👥 Мои группы", "🧾 Добавить трату", "💰 Долги",
+} | _LEGACY_DEBT_BUTTONS | _LEGACY_GROUP_BUTTONS
 
 
 class App:
@@ -2007,7 +2011,7 @@ class App:
 
         rows = []
         for g in gs[start:end]:
-            cb = {"mg": f"mgsel|{g['id']}", "inv": f"invsel|{g['id']}", "ae": f"aesel|{g['id']}"}[mode]
+            cb = {"mg": f"mgsel|{g['id']}", "ae": f"aesel|{g['id']}"}[mode]
             rows.append([InlineKeyboardButton(f"#{g['id']}: {g['title']}", callback_data=cb)])
 
         nav = []
@@ -2017,8 +2021,34 @@ class App:
             nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"{mode}|p:{page + 1}"))
         if nav:
             rows.append(nav)
+        if mode == "mg":
+            rows.append([new_group_button()])
 
         return InlineKeyboardMarkup(rows), total
+
+    async def _send_group_picker(
+        self,
+        update: Update,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        mode: str,
+        page: int = 0,
+    ) -> None:
+        """The group list, or the way to make a first group when there is none."""
+        prompts = {
+            "mg": "Выберите группу:",
+            "ae": "Выберите группу для добавления траты:",
+        }
+        markup, total = self._groups_page_keyboard(
+            update.effective_user.id, page, mode
+        )
+        if total == 0:
+            await self._edit_or_send(
+                update,
+                "У вас пока нет групп. Создайте первую — и позовите в неё людей.",
+                InlineKeyboardMarkup([[new_group_button()]]),
+            )
+            return
+        await self._edit_or_send(update, prompts[mode], markup)
 
     async def _refresh_keyboard(self, update: Update, uid: int) -> None:
         """Send the current keyboard to a user still holding an older one.
@@ -2032,8 +2062,8 @@ class App:
             return
         self.repo.mark_keyboard_current(uid)
         await update.effective_chat.send_message(
-            "Кнопки внизу обновились: «📊 Балансы» и «🔄 Взаимозачёт»"
-            " объединились в «💰 Долги».",
+            "Кнопки внизу обновились: приглашение и создание группы"
+            " переехали в «👥 Мои группы».",
             reply_markup=main_keyboard(),
         )
 
@@ -2316,41 +2346,15 @@ class App:
             return
 
         # Top-level button routing
+        # "➕ Создать группу" is only on retired keyboards now, but a client
+        # keeps showing them until it is handed a new one.
         if txt == "➕ Создать группу":
-            _set_new_group(ctx, True)
-            await update.effective_chat.send_message(
-                "Введи название новой группы одним сообщением."
-            )
-        elif txt == "👥 Мои группы":
-            markup, total = self._groups_page_keyboard(uid, 0, "mg")
-            if total == 0:
-                await update.effective_chat.send_message(
-                    "У вас нет групп. Нажмите «Создать группу»."
-                )
-            else:
-                await update.effective_chat.send_message(
-                    "Выберите группу:", reply_markup=markup
-                )
-        elif txt == "🔗 Приглашение":
-            markup, total = self._groups_page_keyboard(uid, 0, "inv")
-            if total == 0:
-                await update.effective_chat.send_message(
-                    "У вас нет групп. Нажмите «Создать группу»."
-                )
-            else:
-                await update.effective_chat.send_message(
-                    "Выберите группу для приглашения:", reply_markup=markup
-                )
+            await self._ask_group_name(update, ctx)
+        elif txt == "👥 Мои группы" or txt in _LEGACY_GROUP_BUTTONS:
+            # Inviting starts from the group card, which carries the link.
+            await self._send_group_picker(update, ctx, "mg")
         elif txt == "🧾 Добавить трату":
-            markup, total = self._groups_page_keyboard(uid, 0, "ae")
-            if total == 0:
-                await update.effective_chat.send_message(
-                    "У вас нет групп. Нажмите «Создать группу»."
-                )
-            else:
-                await update.effective_chat.send_message(
-                    "Выберите группу для добавления траты:", reply_markup=markup
-                )
+            await self._send_group_picker(update, ctx, "ae")
         elif txt == "💰 Долги" or txt in _LEGACY_DEBT_BUTTONS:
             await self._show_debts(update, ctx)
 
@@ -2395,6 +2399,15 @@ class App:
                 reply_markup=main_keyboard(),
             )
         await self._show_debts(update, ctx)
+
+    async def _ask_group_name(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        _set_new_group(ctx, True)
+        await update.effective_chat.send_message(
+            "Введи название новой группы одним сообщением.",
+            reply_markup=inline_cancel(),
+        )
 
     # ---------- Add-expense wizard (text steps) ----------
 
@@ -2609,16 +2622,18 @@ class App:
             await query.answer("Отменено")
             return
 
+        # Create a group from the group list
+        if data == "gnew":
+            await query.answer()
+            await self._ask_group_name(update, ctx)
+            return
+
         # Group list pagination
-        for prefix, mode, label in [
-            ("mg|p:", "mg", "Выберите группу:"),
-            ("inv|p:", "inv", "Выберите группу для приглашения:"),
-            ("ae|p:", "ae", "Выберите группу для добавления траты:"),
-        ]:
+        for prefix, mode in [("mg|p:", "mg"), ("ae|p:", "ae")]:
             if data.startswith(prefix):
-                page = int(data[len(prefix):])
-                markup, _ = self._groups_page_keyboard(uid, page, mode)
-                await self._edit_or_send(update, label, markup)
+                await self._send_group_picker(
+                    update, ctx, mode, int(data[len(prefix):])
+                )
                 await query.answer()
                 return
 
@@ -2630,15 +2645,6 @@ class App:
                 return
             await self._send_group_details(update, ctx, gid)
             await query.answer()
-            return
-
-        if data.startswith("invsel|"):
-            gid = int(data[len("invsel|"):])
-            if not self.repo.is_group_member(gid, uid):
-                await query.answer("Нет доступа", show_alert=True)
-                return
-            await self._send_invite_for_group(update, gid)
-            await query.answer("Выберите чат для отправки")
             return
 
         if data.startswith("aesel|"):
@@ -3009,12 +3015,7 @@ class App:
                 await query.answer("Вы уже не в группе", show_alert=True)
                 return
             await query.answer("Готово")
-            markup, total = self._groups_page_keyboard(uid, 0, "mg")
-            await self._edit_or_send(
-                update,
-                "Выберите группу:" if total else "У вас нет групп.",
-                markup if total else None,
-            )
+            await self._send_group_picker(update, ctx, "mg")
             return
 
         # Owner removes a member
@@ -3086,8 +3087,7 @@ class App:
             try:
                 self.repo.delete_group(gid)
                 await query.answer("Группа удалена")
-                markup, _ = self._groups_page_keyboard(uid, 0, "mg")
-                await self._edit_or_send(update, "Группа удалена. Ваши группы:", markup)
+                await self._send_group_picker(update, ctx, "mg")
                 return
             except Exception:
                 logger.exception("failed to delete group")
@@ -3289,9 +3289,9 @@ class App:
         owe_you.sort()
 
         lines = [
-            f"Группа #{gid}\n",
-            f"Валюта: {currency}\n",
-            f"Команда: {cmd_html}\n",
+            f"<b>{html.escape(self.repo.get_group_title(gid))}</b>"
+            f" · #{gid} · {currency}\n",
+            f"Приглашение: {cmd_html}\n\n",
         ]
         if not you_owe and not owe_you:
             lines.append("В этой группе долгов нет 🎉")
@@ -3306,27 +3306,26 @@ class App:
             )
         text = "".join(lines)
 
-        # Adding an expense is the reason people open a group, so it leads;
-        # the rest is paired up to keep the keyboard short.
+        # Adding an expense is the reason people open a group, so it leads.
+        # Debts are deliberately absent: that screen spans every group and
+        # lives on the keyboard below, and offering it here reads as if it
+        # showed this group alone. Members sit in the settings, next to the
+        # buttons that change them.
         rows = [
             [InlineKeyboardButton("🧾 Добавить трату", callback_data=f"aesel|{gid}")],
-            [InlineKeyboardButton("💰 Долги", callback_data="debts")],
             [
-                InlineKeyboardButton("📋 Список трат", callback_data=f"explist|{gid}|p:0"),
+                InlineKeyboardButton("📋 Траты", callback_data=f"explist|{gid}|p:0"),
                 InlineKeyboardButton("💸 Платежи", callback_data=f"setlist|{gid}|p:0"),
             ],
             [
-                InlineKeyboardButton("👥 Участники", callback_data=f"members|{gid}|p:0"),
-                InlineKeyboardButton("🔗 Поделиться /join…", url=share),
+                InlineKeyboardButton("🔗 Пригласить", url=share),
+                InlineKeyboardButton("📊 Excel", callback_data=f"xlsx|{gid}"),
             ],
-            [InlineKeyboardButton("📊 Выгрузить в Excel", callback_data=f"xlsx|{gid}")],
+            [
+                InlineKeyboardButton("⚙️ Настройки", callback_data=f"gset|{gid}"),
+                InlineKeyboardButton("« Группы", callback_data="mg|p:0"),
+            ],
         ]
-        rows.append([InlineKeyboardButton(
-            "⚙️ Настройки группы", callback_data=f"gset|{gid}"
-        )])
-        rows.append([InlineKeyboardButton(
-            "« Мои группы", callback_data="mg|p:0"
-        )])
 
         markup = InlineKeyboardMarkup(rows)
         opts = dict(
@@ -3503,32 +3502,6 @@ class App:
             f"Вы вышли из группы «{title}».", reply_markup=main_keyboard()
         )
         return result
-
-    async def _send_invite_for_group(self, update: Update, gid: int) -> None:
-        try:
-            code = self.repo.get_invite_code(gid)
-        except Exception:
-            logger.exception("failed to load invite for group %s", gid)
-            return
-
-        cmd = f"/join {code}"
-        enc = quote(cmd, safe="")
-        share = f"https://t.me/share/url?url={enc}"
-        html_join = f'<a href="{share}">/join {code}</a>'
-        text = f"Приглашение в группу #{gid}:\nКоманда: {html_join}"
-
-        markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Поделиться /join…", url=share)]]
-        )
-        opts = dict(
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-            reply_markup=markup,
-        )
-        if update.callback_query and update.callback_query.message:
-            await update.callback_query.message.edit_text(text, **opts)
-        else:
-            await update.effective_chat.send_message(text, **opts)
 
     async def _send_group_workbook(self, update: Update, gid: int) -> None:
         """Hand the whole group ledger over as a spreadsheet.

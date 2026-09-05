@@ -4,7 +4,7 @@ Python Telegram bot for splitting group expenses with SQLite storage.
 
 ## Features
 
-- Groups with invite links and join codes.
+- Groups with invite links and join codes; the link lives on the group card.
 - One base currency per group; an expense paid in another currency is
   converted at the day's rate, keeps what was actually handed over, and the
   rate can be replaced with the amount the bank really took.
@@ -91,11 +91,47 @@ Important permission rules:
 
 For old databases, migration `002_expense_created_by` backfills `created_by_tg_id` from `payer_tg_id`.
 
+## Navigation
+
+The reply keyboard is permanent screen furniture, so it carries only the daily
+actions:
+
+```
+[🧾 Добавить трату]
+[💰 Долги]  [👥 Мои группы]
+```
+
+Everything else hangs off the screen it belongs to. Creating a group sits on
+the group list, which is also where somebody with no groups yet lands.
+Inviting people sits on the group card, next to the `/join` command itself —
+it used to have a keyboard button of its own, which was a second route to the
+same card.
+
+The card is deliberately short:
+
+```
+Сочи · #1 · RUB
+Приглашение: /join <код>
+<долги по этой группе>
+
+[🧾 Добавить трату]
+[📋 Траты]      [💸 Платежи]
+[🔗 Пригласить] [📊 Excel]
+[⚙️ Настройки]  [« Группы]
+```
+
+Debts are not on it: that screen spans every group and every currency, and a
+button for it here would read as if it showed this group alone — the card
+links to the keyboard button in words instead. Members live in the settings,
+next to the buttons that add and remove them.
+
 A reply keyboard lives on the Telegram client until the bot sends a new one, so
 `users.keyboard_version` records which layout each user has been shown. Bump
 `KEYBOARD_VERSION` when `main_keyboard()` changes: users holding an older layout
 are sent the new one on their next message, and labels from retired keyboards
-stay routed (`_LEGACY_DEBT_BUTTONS`) so the buttons still on their screen work.
+stay routed (`_LEGACY_DEBT_BUTTONS`, `_LEGACY_GROUP_BUTTONS`) so the buttons
+still on their screen work — «🔗 Приглашение» opens the group list, from which
+the card is one tap away.
 
 ## Currencies
 

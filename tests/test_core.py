@@ -332,6 +332,7 @@ class KeyboardTest(unittest.TestCase):
         sent = self.send(app, 1, "📊 Балансы")
         notice, markup = sent[0]
         self.assertIn("обновились", notice)
+        self.assertIn("Мои группы", notice)
         self.assertEqual(
             [[b.text for b in row] for row in markup.keyboard],
             [[b.text for b in row] for row in main.main_keyboard().keyboard],
@@ -1236,6 +1237,114 @@ class ConversionFlowTest(unittest.TestCase):
         asyncio.run(app.on_callback(stale, ctx))
         self.assertIn("закрыт", stale.callback_query.answers[-1][0])
         self.assertEqual(repo.count_group_expenses(gid), 0)
+
+
+class NavigationTest(unittest.TestCase):
+    """The bottom keyboard is permanent screen furniture, so it earns its
+    place: everything else is reachable from the screen it belongs to."""
+
+    def labels(self):
+        return [b.text for row in main.main_keyboard().keyboard for b in row]
+
+    def setup(self):
+        repo = main.Repo(":memory:")
+        repo.upsert_user(1, "@ivan")
+        app = main.App(repo, "bot", rates=FakeRates())
+        return repo, app, types.SimpleNamespace(user_data={}, bot=FakeBot())
+
+    def text(self, app, ctx, txt, uid=1):
+        update = FakeUpdate(uid, txt)
+        asyncio.run(app.on_text(update, ctx))
+        return update
+
+    def press(self, app, ctx, data, uid=1):
+        update = FakeUpdate(uid, "", callback_data=data)
+        asyncio.run(app.on_callback(update, ctx))
+        return update
+
+    def buttons(self, update):
+        markup = update.effective_chat.sent[-1][1]
+        return [b.text for row in markup.inline_keyboard for b in row] if markup else []
+
+    def test_the_keyboard_is_only_the_daily_actions(self):
+        self.assertEqual(
+            self.labels(), ["🧾 Добавить трату", "💰 Долги", "👥 Мои группы"]
+        )
+
+    def test_retired_labels_still_lead_somewhere_useful(self):
+        """A client keeps showing the old keyboard until it is handed a new
+        one, so both buttons have to keep working."""
+        repo, app, ctx = self.setup()
+        repo.create_group("Сочи", 1)
+
+        opened = self.text(app, ctx, "🔗 Приглашение")
+        self.assertIn("Выберите группу", opened.effective_chat.sent[-1][0])
+        self.assertIn("#1: Сочи", self.buttons(opened))
+
+        asked = self.text(app, ctx, "➕ Создать группу")
+        self.assertIn("название", asked.effective_chat.sent[-1][0])
+        for label in main._LEGACY_GROUP_BUTTONS:
+            self.assertNotIn(label, self.labels())
+            self.assertIn(label, main._TOP_BUTTONS)
+
+    def test_creating_a_group_lives_on_the_group_list(self):
+        repo, app, ctx = self.setup()
+
+        empty = self.text(app, ctx, "👥 Мои группы")
+        self.assertEqual(self.buttons(empty), ["➕ Создать группу"])
+
+        self.press(app, ctx, "gnew")
+        self.text(app, ctx, "Сочи")
+        self.assertEqual([g["title"] for g in repo.list_user_groups(1)], ["Сочи"])
+
+        listed = self.text(app, ctx, "👥 Мои группы")
+        self.assertEqual(self.buttons(listed), ["#1: Сочи", "➕ Создать группу"])
+
+    def test_the_empty_state_offers_the_button_everywhere(self):
+        _, app, ctx = self.setup()
+        for entry in ["👥 Мои группы", "🧾 Добавить трату"]:
+            with self.subTest(entry=entry):
+                update = self.text(app, ctx, entry)
+                self.assertEqual(self.buttons(update), ["➕ Создать группу"])
+
+    def test_the_group_card_names_the_group_and_stays_short(self):
+        repo, app, ctx = self.setup()
+        gid, _ = repo.create_group("Сочи", 1)
+
+        card = self.press(app, ctx, f"mgsel|{gid}")
+        text = card.effective_chat.sent[-1][0]
+        self.assertIn("Сочи", text)  # the list showed a name; the card keeps it
+        self.assertIn("RUB", text)
+
+        self.assertEqual(
+            self.buttons(card),
+            ["🧾 Добавить трату", "📋 Траты", "💸 Платежи", "🔗 Пригласить",
+             "📊 Excel", "⚙️ Настройки", "« Группы"],
+        )
+
+    def test_the_card_does_not_pretend_debts_are_per_group(self):
+        """The debts screen spans every group; a button for it on one group's
+        card reads as if it showed that group alone."""
+        repo, app, ctx = self.setup()
+        gid, code = repo.create_group("Сочи", 1)
+        repo.upsert_user(2, "@olya")
+        repo.join_by_code(code, 2)
+        repo.create_expense(gid, 1, 1, "такси", 10000, {1: 5000, 2: 5000})
+
+        card = self.press(app, ctx, f"mgsel|{gid}")
+        self.assertNotIn("💰 Долги", self.buttons(card))
+        self.assertIn("откройте «💰 Долги»", card.effective_chat.sent[-1][0])
+
+    def test_the_invite_link_is_on_the_card(self):
+        repo, app, ctx = self.setup()
+        gid, code = repo.create_group("Сочи", 1)
+
+        card = self.press(app, ctx, f"mgsel|{gid}")
+        markup = card.effective_chat.sent[-1][1]
+        invite = [b for row in markup.inline_keyboard for b in row if b.text == "🔗 Пригласить"]
+        self.assertEqual(len(invite), 1)
+        self.assertIn(code, invite[0].url)
+        self.assertIn(code, card.effective_chat.sent[-1][0])
 
 
 if __name__ == "__main__":
