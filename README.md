@@ -36,6 +36,13 @@ Python Telegram bot for splitting group expenses with SQLite storage.
 
 ## Quick Start
 
+For the Telegram Mini App at the root of a separate HTTPS subdomain, see
+[`deploy/README.md`](deploy/README.md). It includes the isolated Ubuntu systemd
+service, Nginx 8443 vhost, Certbot webroot renewal, reload verification and bot
+menu setup. The Mini App reuses this bot's ledger and validates Telegram
+`initData` on every API request. Set `MINIAPP_URL` to enable it; `MINIAPP_PORT`
+defaults to the candidate loopback port 18082 (check availability before deploying).
+
 1. Install Python 3.11+.
 2. Create a Telegram bot with `@BotFather` and copy the token.
 3. Install dependencies:

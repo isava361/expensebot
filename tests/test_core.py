@@ -1245,7 +1245,7 @@ class ConversionFlowTest(unittest.TestCase):
 
         stale = FakeUpdate(1, "", callback_data="rateok")
         asyncio.run(app.on_callback(stale, ctx))
-        self.assertIn("закрыт", stale.callback_query.answers[-1][0])
+        self.assertIn("больше не активна", stale.callback_query.answers[-1][0])
         self.assertEqual(repo.count_group_expenses(gid), 0)
 
 

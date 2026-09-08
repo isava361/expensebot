@@ -5,3 +5,9 @@ __pycache__/
 *.db-shm
 bot_state.pickle
 *.pickle
+.env
+.env.*
+!.env.example
+.venv/
+deploy/*.tar.gz
+.ui-check/

@@ -70,6 +70,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# HTTP client request URLs contain the Telegram bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -103,6 +106,7 @@ def main() -> None:
     bot_app = App(repo)
     backup_stop = asyncio.Event()
     backup_task = None
+    web_runner = None
 
     async def periodic_backup():
         while not backup_stop.is_set():
@@ -117,16 +121,26 @@ def main() -> None:
                 pass
 
     async def post_init(application: Application) -> None:
-        nonlocal backup_task
+        nonlocal backup_task, web_runner
         me = await application.bot.get_me()
         bot_app.base = me.username
         logger.info("Starting bot @%s …", me.username)
+        miniapp_url = os.environ.get("MINIAPP_URL", "")
+        if miniapp_url:
+            from miniapp import start_web
+            web_runner = await start_web(
+                repo, token, miniapp_url,
+                int(os.environ.get("MINIAPP_PORT", "18082")),
+                int(os.environ.get("INIT_DATA_MAX_AGE", "3600")),
+            )
         backup_task = asyncio.create_task(periodic_backup())
 
     async def post_stop(application: Application) -> None:
         backup_stop.set()
         if backup_task is not None:
             await backup_task
+        if web_runner is not None:
+            await web_runner.cleanup()
 
     async def on_error(update, ctx):
         logger.error(
