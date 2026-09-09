@@ -1,5 +1,5 @@
-// Money arithmetic the Mini App does on its own. Run with:
-//   node --test tests/
+// Money arithmetic and offline queue. Run with:
+//   node --test tests/test_web.js
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -62,7 +62,7 @@ test("group icon follows the title, then the id", () => {
 });
 
 test("byDay keeps the server's order and totals each day", () => {
-  const at = (day, hour) => Math.floor(Date.UTC(2026, 8, day, hour) / 1000);
+  const at = (day, hour) => Math.floor(new Date(2026, 8, day, hour).getTime() / 1000);
   const days = byDay([
     {created_at: at(9, 20), amount_cents: 300},
     {created_at: at(9, 2), amount_cents: 200},
@@ -79,4 +79,65 @@ test("dayLabel names the recent days", () => {
   assert.equal(dayLabel(seconds(0), "ru", now), "Сегодня");
   assert.equal(dayLabel(seconds(1), "ru", now), "Вчера");
   assert.match(dayLabel(seconds(30), "ru", now), /август|августа|авг/);
+});
+
+test("day grouping uses the same local midnight as its labels", () => {
+  const now = new Date(2026, 8, 10, 12).getTime();
+  const days = byDay([10, 9].map(day => ({
+    created_at: new Date(2026, 8, day, day === 10 ? 1 : 23).getTime() / 1000,
+    amount_cents: 100,
+  })));
+  assert.deepEqual(days.map(day => day.key), ["2026-09-10", "2026-09-09"]);
+  assert.deepEqual(days.map(day => dayLabel(day.at, "ru", now)), ["Сегодня", "Вчера"]);
+});
+
+test("offline queue survives retryable errors and reports storage failures", async t => {
+  const previous = {window: globalThis.window, localStorage: globalThis.localStorage, fetch: globalThis.fetch};
+  const storage = new Map();
+  globalThis.window = {};
+  globalThis.localStorage = {getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value)};
+  try {
+    const {enqueue, pending, flush} = await import("../web/lib/api.js");
+    const entry = {path: "/groups/1/expenses", body: {operation_id: "test-operation-123456", amount_cents: 100}};
+    for (const status of [401, 408, 429, 500, 502, 503]) {
+      await t.test(`HTTP ${status} preserves writes for a later successful retry`, async () => {
+        storage.clear();
+        enqueue(entry);
+        globalThis.fetch = async () => new Response("{}", {status});
+        const result = await flush();
+        assert.equal(result.dropped, 0);
+        assert.ok(result.error);
+        assert.deepEqual(pending(), [entry]);
+        globalThis.fetch = async (_url, options) => {
+          assert.deepEqual(JSON.parse(options.body), entry.body);
+          return new Response('{"id":7}');
+        };
+        assert.equal((await flush()).sent, 1);
+        assert.deepEqual(pending(), []);
+      });
+    }
+    await t.test("network loss preserves writes, permanent rejection does not block the next write", async () => {
+      storage.clear();
+      enqueue(entry);
+      globalThis.fetch = async () => { throw new TypeError("Network failed"); };
+      assert.equal((await flush()).dropped, 0);
+      assert.deepEqual(pending(), [entry]);
+      enqueue({...entry, body: {...entry.body, operation_id: "test-operation-654321"}});
+      let calls = 0;
+      globalThis.fetch = async () => new Response("{}", {status: ++calls === 1 ? 400 : 200});
+      assert.deepEqual(await flush(), {sent: 1, dropped: 1, error: ""});
+      assert.deepEqual(pending(), []);
+    });
+    await t.test("storage failure is reported and never erases an existing queue", () => {
+      storage.clear();
+      enqueue(entry);
+      globalThis.localStorage.setItem = () => { throw new Error("Quota exceeded"); };
+      assert.throws(() => enqueue({...entry, body: {...entry.body, operation_id: "another-operation-123"}}), /Не удалось сохранить/);
+      assert.deepEqual(pending(), [entry]);
+    });
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
+    }
+  }
 });

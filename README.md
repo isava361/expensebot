@@ -345,10 +345,24 @@ Run unit tests without starting Telegram polling:
 python -B -m unittest discover -s tests -p "test_*.py"
 ```
 
-The Mini App's own money arithmetic is covered by `tests/test_web.js`, which
+The Mini App's money arithmetic and offline queue are covered by `tests/test_web.js`, which
 the command above runs through `node --test` when node is installed and skips
 when it is not. To run it alone:
 
 ```bash
 node --test tests/test_web.js
 ```
+
+Browser regressions cover expense editing, concurrent currency conversions,
+storage failures, pagination and local dates. They use mocked API responses
+and do not connect to Telegram or a database. Install the optional browser
+test dependency and run:
+
+```bash
+npm install --no-save --package-lock=false playwright
+npx playwright install chromium
+node --test tests/test_web_browser.cjs
+```
+
+Set `MINIAPP_BROWSER_CHANNEL=msedge` to use an installed Microsoft Edge instead
+of Playwright's Chromium.

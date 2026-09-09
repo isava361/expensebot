@@ -28,10 +28,10 @@ export function expenseForm(group, existing, ctx) {
   const currency = select(box, "Валюта", currencies.map(code => [code, code]), startCurrency);
   const conversion = el("div");
   box.append(conversion);
-  let converted = null, shownCurrency = null;
+  let converted = null, shownCurrency = null, rateRequest = 0;
 
   const payer = select(box, "Кто заплатил", group.members.map(member => [member.id, member.name]), existing?.payer ?? me.id);
-  const mode = select(box, "Как разделить", [["equal", "Поровну"], ["parts", "По долям"], ["custom", "Указать суммы"]], "equal");
+  const mode = select(box, "Как разделить", [["equal", "Поровну"], ["parts", "По долям"], ["custom", "Указать суммы"]], existing ? "custom" : "equal");
   const chips = el("div", undefined, "chips");
   chips.append(button("Все", () => { parts.forEach(part => { part.check.checked = true; }); sync(); }, "chip"));
   box.append(el("p", "Участники", "muted"), chips);
@@ -128,7 +128,7 @@ export function expenseForm(group, existing, ctx) {
     review.replaceChildren();
     bindMain(CHECK_LABEL, check);
 
-    const outcome = plan(state);
+    const outcome = plan({...state, converted: converted?.value ?? ""});
     if (outcome.waiting) { tally.textContent = outcome.waiting; tally.className = "tally"; return; }
     if (outcome.error && !outcome.shares) { tally.textContent = outcome.error; tally.className = "tally warn"; return; }
     const sum = outcome.shares.reduce((value, share) => value + share, 0);
@@ -143,18 +143,23 @@ export function expenseForm(group, existing, ctx) {
   const sync = () => render(readState());
 
   async function refreshRate() {
-    if (!converted) return;
+    const mine = ++rateRequest;
+    if (!converted || !box.isConnected) return;
+    const target = converted, sourceCurrency = currency.value, typed = total.value;
+    const current = () => mine === rateRequest && box.isConnected && converted === target
+      && currency.value === sourceCurrency && total.value === typed;
     const hint = conversion.querySelector(".hint");
     let cents;
-    try { cents = amount(total.value); } catch { hint.textContent = "Введите сумму в валюте траты — курс подставится сам."; return; }
+    try { cents = amount(typed); } catch { hint.textContent = "Введите сумму в валюте траты — курс подставится сам."; return; }
     hint.textContent = "Смотрим курс дня…";
     try {
-      const data = await api(`/rate?from=${encodeURIComponent(currency.value)}&to=${encodeURIComponent(group.currency)}&amount=${cents}`);
+      const data = await api(`/rate?from=${encodeURIComponent(sourceCurrency)}&to=${encodeURIComponent(group.currency)}&amount=${cents}`);
+      if (!current()) return;
       if (data.converted == null) { hint.textContent = "Курс недоступен — впишите сумму, которую списал банк."; return; }
       if (!converted.dataset.touched) { converted.value = (data.converted / 100).toFixed(2); sync(); }
       hint.textContent = `Курс дня: 1 ${currency.value} ≈ ${data.rate.toFixed(4)} ${group.currency}. `
         + "Замените на сумму, которую списал банк, если она другая.";
-    } catch { hint.textContent = "Курс недоступен — впишите сумму, которую списал банк."; }
+    } catch { if (current()) hint.textContent = "Курс недоступен — впишите сумму, которую списал банк."; }
   }
 
   function check() {
@@ -205,8 +210,12 @@ export function expenseForm(group, existing, ctx) {
     await reload();
   }
 
-  currency.addEventListener("change", () => { sync(); refreshRate(); });
+  currency.addEventListener("change", () => { clearTimeout(refreshRate.timer); sync(); refreshRate(); });
   total.addEventListener("input", () => {
+    // Invalidate immediately, including the debounce window. An automatic
+    // conversion belongs to the previous amount until a new answer arrives.
+    rateRequest++;
+    if (converted && !converted.dataset.touched) converted.value = "";
     sync();
     clearTimeout(refreshRate.timer);
     refreshRate.timer = setTimeout(refreshRate, 500);

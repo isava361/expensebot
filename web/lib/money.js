@@ -63,10 +63,12 @@ export const groupIcon = group =>
   (ICON_WORDS.find(([pattern]) => pattern.test(group.title)) || [])[1] || ICONS[group.id % ICONS.length];
 
 // Expenses arrive newest first; keep that order and cut them into days.
-export function byDay(expenses, offset = 0) {
+export function byDay(expenses) {
   const days = [];
   for (const expense of expenses) {
-    const key = new Date((expense.created_at - offset) * 1000).toISOString().slice(0, 10);
+    // Use the same local calendar as dayLabel, including DST transitions.
+    const date = new Date(expense.created_at * 1000);
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
     const last = days[days.length - 1];
     if (last && last.key === key) last.expenses.push(expense);
     else days.push({key, at: expense.created_at, expenses: [expense]});

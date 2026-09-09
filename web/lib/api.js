@@ -52,7 +52,8 @@ const readQueue = () => {
   try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]"); } catch { return []; }
 };
 const writeQueue = items => {
-  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(items)); } catch { /* private mode */ }
+  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(items)); }
+  catch { throw new Error("Не удалось сохранить трату на устройстве. Не закрывайте форму: восстановите связь и повторите отправку."); }
 };
 
 export const pending = () => readQueue();
@@ -64,24 +65,28 @@ export function enqueue(entry) {
   writeQueue(items);
 }
 
-/** Replays queued writes oldest first: {sent} landed, {dropped} were refused. */
+/** Replays queued writes oldest first; retryable failures leave the queue intact. */
 export async function flush() {
   let items = readQueue();
   let sent = 0, dropped = 0;
+  let errorMessage = "";
   while (items.length) {
     const [entry] = items;
     try {
       await api(entry.path, "POST", entry.body);
       sent++;
     } catch (error) {
-      // Still offline: leave the queue for the next attempt. A refusal from
-      // the server itself means this write will never succeed — drop it.
-      if (error.offline) break;
+      // Only explicit permanent rejections may discard a write. An expired
+      // login, throttling, server errors and unknown failures need a retry.
+      if (![400, 403, 404, 405, 413, 415, 422].includes(error.status)) {
+        errorMessage = error.message;
+        break;
+      }
       dropped++;
     }
     items = readQueue().filter(item => item.body.operation_id !== entry.body.operation_id);
     writeQueue(items);
   }
   if (sent || dropped) forget();
-  return {sent, dropped};
+  return {sent, dropped, error: errorMessage};
 }

@@ -73,10 +73,11 @@ function queueBanner() {
 }
 
 async function sendQueued() {
-  const {sent, dropped} = await flush();
+  const {sent, dropped, error} = await flush();
   if (sent) notify(sent === 1 ? "Отложенная трата отправлена" : `Отправлено трат: ${sent}`);
   if (dropped) notify("Часть отложенных трат сервер не принял — они удалены из очереди.");
   if (sent || dropped) await refresh();
+  if (error) notify(`${error} Неотправленные траты остаются на устройстве.`);
 }
 
 // -- groups ----------------------------------------------------------------
@@ -218,12 +219,16 @@ function expenses(group, signal) {
         : "Трат пока нет. Добавьте первую общую покупку.", "empty"));
     }
     byDay(data.expenses).forEach(day => {
-      if (day.key !== lastDay) {
+      if (day.key !== lastDay?.key) {
         const header = el("div", undefined, "day");
-        header.append(el("span", dayLabel(day.at, locale)), el("span", cash(day.total, group.currency), "amount"));
+        const subtotal = el("span", "", "amount");
+        subtotal.title = "Сумма загруженных трат за день";
+        header.append(el("span", dayLabel(day.at, locale)), subtotal);
         list.append(header);
-        lastDay = day.key;
+        lastDay = {key: day.key, total: 0, subtotal};
       }
+      lastDay.total += day.total;
+      lastDay.subtotal.textContent = cash(lastDay.total, group.currency);
       list.append(cardList(day.expenses, expense => {
         const card = button("", () => showExpense(group, expense.id, ctx()), "card expense");
         const paid = group.members.find(member => member.id === expense.payer)?.name || expense.payer;

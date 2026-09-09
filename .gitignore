@@ -11,3 +11,4 @@ bot_state.pickle
 .venv/
 deploy/*.tar.gz
 .ui-check/
+node_modules/
