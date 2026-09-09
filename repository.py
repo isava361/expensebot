@@ -29,6 +29,11 @@ class Repo:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # SQLite folds case for ASCII only, so a search for "ужин" would not
+        # find "Ужин". Python knows the rest of Unicode.
+        self._conn.create_function(
+            "casefold", 1, lambda s: s.casefold() if s else s, deterministic=True
+        )
         try:
             if (
                 self.db_path != ":memory:"
@@ -780,17 +785,37 @@ class Repo:
             ).fetchall()
         return {r["participant_tg_id"]: r["share_cents"] for r in rows}
 
+    @staticmethod
+    def _expense_filter(query: str, payer: int) -> tuple[str, list]:
+        """Optional narrowing shared by the expense list and its count."""
+        sql, params = "", []
+        if query:
+            sql += " AND casefold(description) LIKE ? ESCAPE '\\'"
+            escaped = (
+                query.casefold()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            params.append(f"%{escaped}%")
+        if payer:
+            sql += " AND payer_tg_id=?"
+            params.append(payer)
+        return sql, params
+
     def list_group_expenses(
-        self, group_id: int, limit: int, offset: int, deleted=False
+        self, group_id: int, limit: int, offset: int, deleted=False, query="", payer=0
     ) -> list[dict]:
+        narrow, extra = self._expense_filter(query, payer)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id,payer_tg_id,created_by_tg_id,amount_cents,description,"
                 "created_at,updated_at,orig_currency,orig_amount_cents,"
                 "receipt_file_id"
                 " FROM expenses WHERE group_id=? AND deleted=?"
-                " ORDER BY id DESC LIMIT ? OFFSET ?",
-                (group_id, deleted, limit, offset),
+                + narrow
+                + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                (group_id, deleted, *extra, limit, offset),
             ).fetchall()
         return [
             {
@@ -808,11 +833,23 @@ class Repo:
             for r in rows
         ]
 
-    def count_group_expenses(self, group_id: int, deleted=False) -> int:
+    def count_group_expenses(self, group_id: int, deleted=False, query="", payer=0):
+        narrow, extra = self._expense_filter(query, payer)
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM expenses WHERE group_id=? AND deleted=?",
-                (group_id, deleted),
+                "SELECT COUNT(*) FROM expenses WHERE group_id=? AND deleted=?" + narrow,
+                (group_id, deleted, *extra),
+            ).fetchone()
+        return row[0] if row else 0
+
+    def sum_group_expenses(self, group_id: int, query="", payer=0) -> int:
+        """What the matching expenses add up to, for the list's own total."""
+        narrow, extra = self._expense_filter(query, payer)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(amount_cents), 0) FROM expenses"
+                " WHERE group_id=? AND deleted=0" + narrow,
+                (group_id, *extra),
             ).fetchone()
         return row[0] if row else 0
 

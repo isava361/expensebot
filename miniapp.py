@@ -15,6 +15,9 @@ from aiohttp import web
 from core import MAX_AMOUNT_CENTS, KNOWN_CURRENCIES, normalize_currency
 
 STATIC = Path(__file__).with_name("web")
+# One or more lowercase path segments ending in a web extension: enough for
+# module folders, and no way to name a dotfile or climb out of web/.
+STATIC_NAME = re.compile(r"[a-z0-9_-]+(?:/[a-z0-9_-]+)*\.(?:html|js|css|map)")
 logger = logging.getLogger(__name__)
 
 
@@ -214,6 +217,13 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                 "balances": repo.member_balances(gid),
                 "is_owner": repo.is_group_owner(gid, uid),
                 "can_change_currency": repo.can_change_currency(gid),
+                # Who owes whom inside this group alone, already simplified
+                # through chains. Settling still happens on the netted
+                # cross-group figure, so this is shown, not acted on.
+                "transfers": [
+                    {"from": pair[0], "to": pair[1], "amount_cents": cents}
+                    for pair, cents in repo.compute_group_balances(gid).items()
+                ],
             }
         if section == "settings" and method == "POST":
             if not repo.is_group_owner(gid, uid):
@@ -252,10 +262,22 @@ def dispatch(repo, user, method, path, body, query, bot=""):
         if section == "expenses" and not item:
             if method == "GET":
                 offset = integer(int(query.get("offset", "0")), 0, 1000000)
-                expenses = repo.list_group_expenses(gid, 30, offset)
+                search = query.get("q", "")[:100].strip()
+                payer = integer(int(query.get("payer", "0")), 0, 2**52 - 1)
+                if payer and not repo.is_group_member(gid, payer):
+                    raise ValueError("Этот человек не в группе.")
+                expenses = repo.list_group_expenses(
+                    gid, 30, offset, query=search, payer=payer
+                )
                 for expense in expenses:
                     expense.pop("receipt", None)
-                return {"expenses": expenses, "total": repo.count_group_expenses(gid)}
+                return {
+                    "expenses": expenses,
+                    "total": repo.count_group_expenses(gid, query=search, payer=payer),
+                    "sum_cents": repo.sum_group_expenses(
+                        gid, query=search, payer=payer
+                    ),
+                }
             if method == "POST":
                 payer, desc, amount, shares, orig, orig_amount = expense_fields(body)
                 operation = string(body.get("operation_id"), 64)
@@ -406,17 +428,21 @@ def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
         return web.json_response({"status": "ok", "app": "expensebot"})
 
     async def static(request):
-        name = request.match_info.get("name", "index.html")
-        if name not in {"index.html", "app.js", "app.css"}:
+        """Serve web/ as ES modules: a lowercase name, one safe extension."""
+        name = request.match_info.get("name") or "index.html"
+        if not STATIC_NAME.fullmatch(name):
             raise web.HTTPNotFound()
-        return web.FileResponse(STATIC / name)
+        path = (STATIC / name).resolve()
+        if not path.is_file() or STATIC.resolve() not in path.parents:
+            raise web.HTTPNotFound()
+        return web.FileResponse(path)
 
     app = web.Application(middlewares=[security], client_max_size=32768)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/rate", rate)
     app.router.add_route("*", "/api/{path:.*}", api)
     app.router.add_get("/", static)
-    app.router.add_get("/{name}", static)
+    app.router.add_get("/{name:.*}", static)
     return app
 
 

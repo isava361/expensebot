@@ -1,8 +1,11 @@
 import hashlib
 import hmac
 import json
+import shutil
+import subprocess
 import time
 import unittest
+from pathlib import Path
 from urllib.parse import urlencode
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -255,6 +258,50 @@ class MiniAppTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 413)
 
 
+class WebModuleTest(unittest.TestCase):
+    """The Mini App's own money arithmetic, checked by node when it is here."""
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_money_module(self):
+        suite = Path(__file__).with_name("test_web.js")
+        result = subprocess.run(
+            [shutil.which("node"), "--test", str(suite)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class MiniAppStaticTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.repo = Repo(":memory:")
+        self.client = TestClient(TestServer(create_web_app(self.repo, TOKEN, URL)))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.repo.close()
+
+    async def test_modules_are_served_and_nothing_else_is(self):
+        for path in ("/", "/app.js", "/app.css", "/lib/money.js", "/expense.js"):
+            response = await self.client.get(path)
+            self.assertEqual(response.status, 200, path)
+            self.assertNotIn(TOKEN, await response.text())
+        for path in (
+            "/../miniapp.py",
+            "/lib/../../miniapp.py",
+            "/lib/money.js/",
+            "/Lib/money.js",
+            "/lib/money.py",
+            "/.env",
+            "/web/app.js",
+            "/lib/",
+        ):
+            self.assertEqual((await self.client.get(path)).status, 404, path)
+
+
 class MiniAppEditingTest(unittest.IsolatedAsyncioTestCase):
     """Editing, group settings and the currency endpoint the Mini App added."""
 
@@ -418,6 +465,42 @@ class MiniAppEditingTest(unittest.IsolatedAsyncioTestCase):
         response = await self.request("POST", f"/api/groups/{self.gid}/leave", json={})
         self.assertTrue((await response.json())["deleted"])
         self.assertEqual(self.repo.list_user_groups(1), [])
+
+    async def test_expense_list_searches_filters_and_totals(self):
+        self.repo.create_expense(self.gid, 1, 1, "Ужин у моря", 42000, {1: 42000})
+        self.repo.create_expense(self.gid, 1, 2, "УЖИН в отеле", 10000, {2: 10000})
+        self.repo.create_expense(self.gid, 1, 2, "Такси", 5000, {2: 5000})
+        path = f"/api/groups/{self.gid}/expenses"
+
+        async def listing(query=""):
+            return await (await self.request("GET", path + query)).json()
+
+        everything = await listing()
+        self.assertEqual((everything["total"], everything["sum_cents"]), (3, 57000))
+        # Case folding has to reach Cyrillic, which SQLite does not fold itself.
+        found = await listing("?q=ужин")
+        self.assertEqual((found["total"], found["sum_cents"]), (2, 52000))
+        self.assertEqual(
+            {e["desc"] for e in found["expenses"]}, {"Ужин у моря", "УЖИН в отеле"}
+        )
+        by_payer = await listing("?payer=2")
+        self.assertEqual((by_payer["total"], by_payer["sum_cents"]), (2, 15000))
+        both = await listing("?q=ужин&payer=2")
+        self.assertEqual((both["total"], both["sum_cents"]), (1, 10000))
+        # A wildcard is text, not syntax.
+        self.assertEqual((await listing("?q=%"))["total"], 0)
+        self.assertEqual((await listing("?q=нет+такого"))["total"], 0)
+        self.assertEqual((await self.request("GET", path + "?payer=3")).status, 400)
+
+    async def test_group_payload_lists_who_owes_whom_inside_it(self):
+        self.repo.create_expense(self.gid, 1, 1, "Dinner", 10000, {1: 5000, 2: 5000})
+        payload = await (await self.request("GET", f"/api/groups/{self.gid}")).json()
+        self.assertEqual(
+            payload["transfers"], [{"from": 2, "to": 1, "amount_cents": 5000}]
+        )
+        self.repo.create_expense(self.gid, 2, 2, "Taxi", 10000, {1: 5000, 2: 5000})
+        payload = await (await self.request("GET", f"/api/groups/{self.gid}")).json()
+        self.assertEqual(payload["transfers"], [])
 
     async def test_group_payload_states_who_may_change_what(self):
         payload = await (await self.request("GET", f"/api/groups/{self.gid}")).json()

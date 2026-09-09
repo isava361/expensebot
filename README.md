@@ -331,6 +331,11 @@ migrations also work on restored databases from older versions.
 - `handlers.py`: Telegram screens, expense wizard and notifications.
 - `rates.py`: cached currency conversion.
 - `workbook.py`: XLSX writer and group reports.
+- `miniapp.py`: Mini App HTTP server, `initData` validation and its API.
+- `web/`: the Mini App itself, as ES modules — `lib/money.js` (splitting and
+  formatting, no DOM), `lib/api.js` (requests, the memory cache and the
+  offline queue), `lib/tg.js` (Telegram buttons, haptics, theme, viewport),
+  `lib/dom.js` (the shared widgets), `expense.js` and `app.js` (the screens).
 
 ## Tests
 
@@ -338,4 +343,12 @@ Run unit tests without starting Telegram polling:
 
 ```bash
 python -B -m unittest discover -s tests -p "test_*.py"
+```
+
+The Mini App's own money arithmetic is covered by `tests/test_web.js`, which
+the command above runs through `node --test` when node is installed and skips
+when it is not. To run it alone:
+
+```bash
+node --test tests/test_web.js
 ```
