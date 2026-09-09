@@ -54,9 +54,79 @@ function setScreenMain(text, action) { screenMain = text ? {text, action} : null
 function restoreMain() { if (screenMain) bindMain(screenMain.text, screenMain.action); else unbindMain(); }
 function primary(box, text, action) { const node = button(text, action, "wide"); box.append(node); if (bindMain(text, action)) node.hidden = true; return node; }
 
+// -- viewport ---------------------------------------------------------------
+// The keyboard shrinks the visual viewport but not the layout one, so a dialog
+// sized in vh ends up half-covered. Publish the visible band as CSS variables
+// and let the dialog sit inside it.
+function resizeViewport() {
+  const view = window.visualViewport;
+  // A stable Telegram height lags behind keyboard transitions; prefer the
+  // browser's own measurement when it is available.
+  const height = view?.height || tg?.viewportStableHeight || innerHeight;
+  const top = view?.offsetTop || 0;
+  const root = document.documentElement;
+  root.style.setProperty("--visible-height", `${height}px`);
+  root.style.setProperty("--visible-top", `${top}px`);
+  root.style.setProperty("--keyboard-bottom", `${Math.max(0, root.clientHeight - top - height)}px`);
+}
+// overflow:hidden alone does not stop iOS panning the page behind a dialog to
+// reveal the focused field; the body has to be pinned where it stood.
+let lockedPage = null;
+function setPageLocked(locked) {
+  const root = document.documentElement;
+  if (locked && !lockedPage) {
+    lockedPage = {x: window.scrollX, y: window.scrollY};
+    root.style.setProperty("--locked-width", `${document.body.getBoundingClientRect().width}px`);
+    root.style.setProperty("--locked-top", `${-lockedPage.y}px`);
+    root.style.setProperty("--locked-left", `${-lockedPage.x}px`);
+    root.classList.add("locked");
+  } else if (!locked && lockedPage) {
+    const {x, y} = lockedPage;
+    lockedPage = null;
+    root.classList.remove("locked");
+    ["--locked-width", "--locked-top", "--locked-left"].forEach(name => root.style.removeProperty(name));
+    window.scrollTo({left: x, top: y, behavior: "instant"});
+  }
+}
+
+// iOS pans its visual viewport with a finger even through overflow:hidden once
+// the keyboard is up. While the page is locked, a drag may only scroll
+// something inside the dialog that still has room to move; everything else is
+// cancelled outright.
+let dialogTouch = null;
+document.addEventListener("touchstart", event => {
+  dialogTouch = null;
+  if (!lockedPage || event.touches.length !== 1) return;
+  const touch = event.touches[0];
+  const box = modal.open ? modal.getBoundingClientRect() : null;
+  const inside = box && touch.clientX >= box.left && touch.clientX <= box.right && touch.clientY >= box.top && touch.clientY <= box.bottom;
+  dialogTouch = {x: touch.clientX, y: touch.clientY, target: event.target, inside};
+}, {passive: true});
+document.addEventListener("touchmove", event => {
+  if (!lockedPage || !dialogTouch || event.touches.length !== 1) return;
+  const touch = event.touches[0];
+  const dx = touch.clientX - dialogTouch.x;
+  const dy = touch.clientY - dialogTouch.y;
+  dialogTouch.x = touch.clientX; dialogTouch.y = touch.clientY;
+  if (!dx && !dy) return;
+  if (dialogTouch.inside && modal.open && Math.abs(dy) > Math.abs(dx)) {
+    for (let node = dialogTouch.target; node instanceof Element && modal.contains(node); node = node.parentElement) {
+      if (!/^(auto|scroll)$/.test(getComputedStyle(node).overflowY)) continue;
+      const remaining = node.scrollHeight - node.clientHeight;
+      if (remaining > 1 && (dy < 0 ? node.scrollTop < remaining - 1 : node.scrollTop > 0)) return;
+    }
+  }
+  if (event.cancelable) event.preventDefault();
+}, {passive: false});
+["touchend", "touchcancel"].forEach(type => document.addEventListener(type, () => { dialogTouch = null; }, {passive: true}));
+
 // Each opening gets its own container, so the listeners a form hangs on its
 // box die with it instead of firing inside the next dialog.
-function openModal(title) { const box = el("div"); box.append(el("h2", title)); modalBody.replaceChildren(box); unbindMain(); if (!modal.open) modal.showModal(); tg?.BackButton.show(); return box; }
+function openModal(title) {
+  const box = el("div"); box.append(el("h2", title)); modalBody.replaceChildren(box); unbindMain();
+  if (!modal.open) { setPageLocked(true); modal.showModal(); resizeViewport(); }
+  tg?.BackButton.show(); return box;
+}
 function backState(visible) { if (visible) tg?.BackButton.show(); else tg?.BackButton.hide(); }
 // Older clients throw on methods they do not know; showConfirm lands in 6.2.
 const supports = version => Boolean(tg?.isVersionAtLeast?.(version));
@@ -177,7 +247,6 @@ function expenseForm(group, existing) {
   const payer = select(box, "Кто заплатил", group.members.map(member => [member.id, member.name]), existing?.payer ?? me.id);
   const mode = select(box, "Как разделить", [["equal", "Поровну"], ["parts", "По долям"], ["custom", "Указать суммы"]], "equal");
   const chips = el("div", undefined, "chips");
-  const quick = (text, action) => button(text, () => { action(); update(); }, "chip");
   box.append(el("p", "Участники", "muted"), chips);
   const parts = group.members.map(member => {
     const label = el("label", undefined, "participant"); const check = el("input"); check.type = "checkbox";
@@ -187,7 +256,7 @@ function expenseForm(group, existing) {
     label.append(check, el("span", member.name), share); box.append(label);
     return {member, check, share};
   });
-  chips.append(quick("Все", () => parts.forEach(part => { part.check.checked = true; })), quick("Никого", () => parts.forEach(part => { part.check.checked = false; })), quick("Только я", () => parts.forEach(part => { part.check.checked = part.member.id === me.id; })), quick("Я и плательщик", () => parts.forEach(part => { part.check.checked = [me.id, Number(payer.value)].includes(part.member.id); })));
+  chips.append(button("Все", () => { parts.forEach(part => { part.check.checked = true; }); update(); }, "chip"));
   const tally = el("p", "", "tally"); box.append(tally);
   const review = el("div"); const operation = crypto.randomUUID().replace(/-/g, "");
 
@@ -316,13 +385,20 @@ const refresh = () => currentTab === "debts" ? showDebts() : currentGroup ? show
 document.querySelector("#groups-tab").onclick = () => showGroups();
 document.querySelector("#debts-tab").onclick = () => showDebts();
 document.querySelector("#close-modal").onclick = () => modal.close();
-modal.addEventListener("close", () => { modalBody.replaceChildren(); restoreMain(); backState(currentGroup !== null); });
+modal.addEventListener("close", () => { setPageLocked(false); modalBody.replaceChildren(); restoreMain(); backState(currentGroup !== null); });
 tg?.BackButton.onClick(() => { if (modal.open) modal.close(); else if (currentGroup !== null) showGroups(); });
 
+window.visualViewport?.addEventListener("resize", resizeViewport);
+window.visualViewport?.addEventListener("scroll", resizeViewport);
+window.addEventListener("resize", resizeViewport);
+resizeViewport();
 function paintTheme() { document.querySelector('meta[name=theme-color]').setAttribute("content", getComputedStyle(document.body).backgroundColor); if (!supports("6.1")) return; try { tg.setHeaderColor("secondary_bg_color"); tg.setBackgroundColor("secondary_bg_color"); } catch { /* the client refused the colour */ } }
 
 (async () => {
   tg?.ready(); tg?.expand(); paintTheme(); tg?.onEvent?.("themeChanged", paintTheme);
+  tg?.onEvent?.("viewportChanged", resizeViewport);
+  // A vertical swipe inside a form should scroll it, not drag the app shut.
+  if (supports("7.7")) { try { tg.disableVerticalSwipes(); } catch { /* client refused */ } }
   if (!tg?.initData) { app.replaceChildren(el("div", "Откройте «Расходы» через кнопку меню в чате с ботом Telegram.", "empty")); document.querySelector("nav").hidden = true; return; }
   const start = async () => { const data = await api("/me"); me = data.user; bot = data.bot || ""; currencies = data.currencies; await showGroups(); };
   try { await start(); } catch (error) { app.replaceChildren(failure(error.message, start)); }
