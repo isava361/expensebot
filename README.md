@@ -43,6 +43,13 @@ menu setup. The Mini App reuses this bot's ledger and validates Telegram
 `initData` on every API request. Set `MINIAPP_URL` to enable it; `MINIAPP_PORT`
 defaults to the candidate loopback port 18082 (check availability before deploying).
 
+The Mini App covers groups, invites, expenses (create, edit and delete, in the
+group's currency or a foreign one converted at the day's rate), group settings
+(rename, base currency while the group is empty, remove a member, leave) and
+the debts screen with payments. It drives Telegram's own main and back buttons
+and haptics rather than drawing its own chrome. Expense history, receipt photos
+and Excel export have no Mini App screen yet and stay in the chat with the bot.
+
 1. Install Python 3.11+.
 2. Create a Telegram bot with `@BotFather` and copy the token.
 3. Install dependencies:

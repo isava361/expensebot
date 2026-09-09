@@ -132,6 +132,9 @@ def main() -> None:
                 repo, token, miniapp_url,
                 int(os.environ.get("MINIAPP_PORT", "18082")),
                 int(os.environ.get("INIT_DATA_MAX_AGE", "3600")),
+                # Share the bot's cache so the Mini App does not refetch rates.
+                bot_app.rates,
+                bot_app.base,
             )
         backup_task = asyncio.create_task(periodic_backup())
 

@@ -87,13 +87,56 @@ def string(value, maximum=200):
     return value.strip()
 
 
-def dispatch(repo, user, method, path, body, query):
+LEAVE_ERRORS = {
+    "not_member": "Вы уже не состоите в этой группе.",
+    "has_debt": "Сначала рассчитайтесь: в группе остаётся ваш непогашенный долг.",
+}
+REMOVE_ERRORS = {
+    "not_member": "Этот человек уже не в группе.",
+    "has_debt": "У участника остаётся непогашенный долг в группе.",
+    "owner": "Владельца группы убрать нельзя — он может только выйти сам.",
+}
+
+
+def expense_fields(body):
+    """One shape of expense payload, validated the same way for create and edit."""
+    amount = integer(body.get("amount_cents"))
+    payer = integer(body.get("payer"), maximum=2**52 - 1)
+    desc = string(body.get("description"), 500)
+    participants = body.get("participants")
+    if not isinstance(participants, list) or not 1 <= len(participants) <= 500:
+        raise ValueError("Выберите участников.")
+    participants = [integer(p, maximum=2**52 - 1) for p in participants]
+    if len(set(participants)) != len(participants):
+        raise ValueError("Повторяющиеся участники.")
+    custom = body.get("shares")
+    if custom is None:
+        part, rest = divmod(amount, len(participants))
+        shares = {p: part + (i < rest) for i, p in enumerate(participants)}
+    else:
+        if not isinstance(custom, list) or len(custom) != len(participants):
+            raise ValueError("Укажите долю каждого участника.")
+        shares = dict(zip(participants, [integer(v, 0) for v in custom]))
+    orig_currency, orig_amount = "", 0
+    if body.get("orig_currency"):
+        orig_currency = normalize_currency(string(body["orig_currency"], 3))
+        if not orig_currency:
+            raise ValueError("Неизвестная валюта.")
+        orig_amount = integer(body.get("orig_amount_cents"))
+    return payer, desc, amount, shares, orig_currency, orig_amount
+
+
+def dispatch(repo, user, method, path, body, query, bot=""):
     """Run under one repository lock, including authorization and subsequent reads/writes."""
     uid = user["id"]
     with repo._lock:
         repo.upsert_user(uid, user["name"])
         if path == "/api/me" and method == "GET":
-            return {"user": user, "currencies": sorted(KNOWN_CURRENCIES)}
+            return {
+                "user": user,
+                "currencies": sorted(KNOWN_CURRENCIES),
+                "bot": bot,
+            }
         if path == "/api/groups":
             if method == "GET":
                 return {
@@ -151,23 +194,62 @@ def dispatch(repo, user, method, path, body, query):
                 raise web.HTTPForbidden()
             return {"ok": True}
         match = re.fullmatch(
-            r"/api/groups/([0-9]+)(?:/(expenses)(?:/([0-9]+))?)?", path
+            r"/api/groups/([0-9]+)"
+            r"(?:/(expenses|settings|leave|members)(?:/([0-9]+))?)?",
+            path,
         )
         if not match:
             raise web.HTTPNotFound()
         gid = int(match[1])
         if not repo.is_group_member(gid, uid):
             raise web.HTTPForbidden()
-        if not match[2] and method == "GET":
+        section, item = match[2], match[3]
+        if not section and method == "GET":
             return {
                 "id": gid,
                 "title": repo.get_group_title(gid),
                 "currency": repo.group_currency(gid),
-                "members": repo.list_members(gid),
+                "members": repo.list_members_detailed(gid),
                 "invite_code": repo.get_invite_code(gid),
                 "balances": repo.member_balances(gid),
+                "is_owner": repo.is_group_owner(gid, uid),
+                "can_change_currency": repo.can_change_currency(gid),
             }
-        if match[2] and not match[3]:
+        if section == "settings" and method == "POST":
+            if not repo.is_group_owner(gid, uid):
+                raise web.HTTPForbidden()
+            if "title" in body and not repo.rename_group(
+                gid, string(body["title"], 100)
+            ):
+                raise ValueError("Не удалось переименовать группу.")
+            if "currency" in body:
+                currency = normalize_currency(string(body["currency"], 3))
+                if not currency:
+                    raise ValueError("Неизвестная валюта.")
+                if currency != repo.group_currency(gid) and not repo.set_group_currency(
+                    gid, currency
+                ):
+                    raise ValueError(
+                        "Валюту можно сменить, только пока в группе нет трат и платежей."
+                    )
+            return {"ok": True}
+        if section == "leave" and method == "POST":
+            reason = repo.leave_group(gid, uid)
+            if reason not in ("", "last"):
+                raise ValueError(
+                    LEAVE_ERRORS.get(reason, "Не удалось выйти из группы.")
+                )
+            return {"ok": True, "deleted": reason == "last"}
+        if section == "members" and item and method == "DELETE":
+            if not repo.is_group_owner(gid, uid):
+                raise web.HTTPForbidden()
+            reason = repo.remove_member(gid, int(item))
+            if reason:
+                raise ValueError(
+                    REMOVE_ERRORS.get(reason, "Не удалось убрать участника.")
+                )
+            return {"ok": True}
+        if section == "expenses" and not item:
             if method == "GET":
                 offset = integer(int(query.get("offset", "0")), 0, 1000000)
                 expenses = repo.list_group_expenses(gid, 30, offset)
@@ -175,26 +257,7 @@ def dispatch(repo, user, method, path, body, query):
                     expense.pop("receipt", None)
                 return {"expenses": expenses, "total": repo.count_group_expenses(gid)}
             if method == "POST":
-                amount = integer(body.get("amount_cents"))
-                payer = integer(body.get("payer"), maximum=2**52 - 1)
-                desc = string(body.get("description"), 500)
-                participants = body.get("participants")
-                if (
-                    not isinstance(participants, list)
-                    or not 1 <= len(participants) <= 500
-                ):
-                    raise ValueError("Выберите участников.")
-                participants = [integer(p, maximum=2**52 - 1) for p in participants]
-                if len(set(participants)) != len(participants):
-                    raise ValueError("Повторяющиеся участники.")
-                custom = body.get("shares")
-                if custom is None:
-                    part, rest = divmod(amount, len(participants))
-                    shares = {p: part + (i < rest) for i, p in enumerate(participants)}
-                else:
-                    if not isinstance(custom, list) or len(custom) != len(participants):
-                        raise ValueError("Укажите долю каждого участника.")
-                    shares = dict(zip(participants, [integer(v, 0) for v in custom]))
+                payer, desc, amount, shares, orig, orig_amount = expense_fields(body)
                 operation = string(body.get("operation_id"), 64)
                 if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", operation):
                     raise ValueError("Некорректный идентификатор операции.")
@@ -205,17 +268,40 @@ def dispatch(repo, user, method, path, body, query):
                     desc,
                     amount,
                     shares,
+                    orig_currency=orig,
+                    orig_amount_cents=orig_amount,
                     operation_id=f"web:{uid}:{operation}",
                 )
                 return {"id": eid}
-        if match[3]:
-            eid = int(match[3])
+        if section == "expenses" and item:
+            eid = int(item)
             expense = repo.get_expense(eid, gid)
             if not expense:
                 raise web.HTTPNotFound()
             if method == "GET":
                 expense.pop("receipt", None)
-                return dict(expense, shares=repo.get_expense_shares(eid))
+                return dict(
+                    expense,
+                    shares=repo.get_expense_shares(eid),
+                    can_edit=repo.can_edit_expense(eid, gid, uid),
+                )
+            if method == "POST":
+                if not repo.can_edit_expense(eid, gid, uid):
+                    raise web.HTTPForbidden()
+                payer, desc, amount, shares, orig, orig_amount = expense_fields(body)
+                repo.update_expense(
+                    eid,
+                    gid,
+                    payer,
+                    desc,
+                    amount,
+                    shares,
+                    orig_currency=orig,
+                    orig_amount_cents=orig_amount,
+                    actor=uid,
+                    expected_revision=integer(body.get("revision"), 0, 2**31),
+                )
+                return {"ok": True}
             if method == "DELETE":
                 if not repo.can_delete_expense(eid, gid, uid):
                     raise web.HTTPForbidden()
@@ -224,7 +310,7 @@ def dispatch(repo, user, method, path, body, query):
         raise web.HTTPMethodNotAllowed(method, ["GET", "POST"])
 
 
-def create_web_app(repo, token, url, max_age=3600):
+def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
     origin = validate_url(url)
     if not token or not 60 <= max_age <= 86400:
         raise ValueError("BOT_TOKEN and INIT_DATA_MAX_AGE (60..86400) required")
@@ -292,8 +378,29 @@ def create_web_app(repo, token, url, max_age=3600):
             request.path,
             body,
             dict(request.query),
+            bot,
         )
         return web.json_response(result)
+
+    async def rate(request):
+        """Outside `dispatch`: the provider call is async and must not hold the lock."""
+        if rates is None:
+            raise web.HTTPNotFound()
+        orig = normalize_currency(request.query.get("from", ""))
+        base = normalize_currency(request.query.get("to", ""))
+        if not orig or not base:
+            raise ValueError("Неизвестная валюта.")
+        amount = integer(int(request.query.get("amount", "0")))
+        converted = await rates.convert(amount, orig, base)
+        if converted is None:
+            return web.json_response({"converted": None})
+        return web.json_response(
+            {
+                "converted": converted[0],
+                "rate": converted[1],
+                "updated": converted[2],
+            }
+        )
 
     async def health(request):
         return web.json_response({"status": "ok", "app": "expensebot"})
@@ -306,15 +413,18 @@ def create_web_app(repo, token, url, max_age=3600):
 
     app = web.Application(middlewares=[security], client_max_size=32768)
     app.router.add_get("/healthz", health)
+    app.router.add_get("/api/rate", rate)
     app.router.add_route("*", "/api/{path:.*}", api)
     app.router.add_get("/", static)
     app.router.add_get("/{name}", static)
     return app
 
 
-async def start_web(repo, token, url, port, max_age=3600):
+async def start_web(repo, token, url, port, max_age=3600, rates=None, bot=""):
     integer(port, 1024, 65535)
-    runner = web.AppRunner(create_web_app(repo, token, url, max_age), access_log=None)
+    runner = web.AppRunner(
+        create_web_app(repo, token, url, max_age, rates, bot), access_log=None
+    )
     await runner.setup()
     try:
         await web.TCPSite(runner, "127.0.0.1", port).start()

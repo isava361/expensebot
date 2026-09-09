@@ -10,10 +10,9 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header><div class="brand">₽</div><div><small>EXPENSE BOT</small><h1>Общие расходы</h1></div><button id="refresh" class="quiet" aria-label="Обновить">↻</button></header>
-  <main id="app" aria-live="polite"><div class="empty">Подключаемся к Telegram…</div></main>
-  <p id="notice" role="status" hidden></p>
-  <nav aria-label="Основные разделы"><button id="groups-tab" class="active">Группы</button><button id="debts-tab">Долги и платежи</button></nav>
+  <main id="app"><div class="card skeleton"></div><div class="card skeleton"></div><div class="card skeleton"></div></main>
+  <p id="notice" role="status" aria-live="polite" hidden></p>
+  <nav aria-label="Основные разделы"><button id="groups-tab" class="active" aria-current="page">Группы</button><button id="debts-tab">Долги и платежи</button></nav>
   <dialog id="modal"><div id="modal-body"></div><button id="close-modal" class="quiet">Закрыть</button></dialog>
 </body>
 </html>

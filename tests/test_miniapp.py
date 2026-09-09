@@ -255,5 +255,185 @@ class MiniAppTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 413)
 
 
+class MiniAppEditingTest(unittest.IsolatedAsyncioTestCase):
+    """Editing, group settings and the currency endpoint the Mini App added."""
+
+    class Rates:
+        async def convert(self, amount_cents, orig, base):
+            if (orig, base) != ("TRY", "RUB"):
+                return None
+            return amount_cents * 2, 2.0, 1700000000
+
+    async def asyncSetUp(self):
+        self.repo = Repo(":memory:")
+        for uid in (1, 2, 3):
+            self.repo.upsert_user(uid, f"User {uid}")
+        self.gid, code = self.repo.create_group("Trip", 1, "RUB")
+        self.repo.join_by_code(code, 2)
+        self.client = TestClient(
+            TestServer(
+                create_web_app(self.repo, TOKEN, URL, rates=self.Rates(), bot="thebot")
+            )
+        )
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.repo.close()
+
+    async def request(self, method, path, uid=1, **kwargs):
+        return await self.client.request(
+            method, path, headers={"Authorization": "tma " + signed(uid)}, **kwargs
+        )
+
+    async def test_me_carries_the_bot_username_for_invite_links(self):
+        response = await self.request("GET", "/api/me")
+        self.assertEqual((await response.json())["bot"], "thebot")
+
+    async def test_rate_converts_and_reports_a_missing_pair(self):
+        response = await self.request("GET", "/api/rate?from=try&to=rub&amount=1000")
+        self.assertEqual(
+            {k: v for k, v in (await response.json()).items() if k != "updated"},
+            {"converted": 2000, "rate": 2.0},
+        )
+        response = await self.request("GET", "/api/rate?from=EUR&to=RUB&amount=1000")
+        self.assertIsNone((await response.json())["converted"])
+        for query in ("from=XXX&to=RUB&amount=1", "from=TRY&to=RUB&amount=0"):
+            self.assertEqual(
+                (await self.request("GET", f"/api/rate?{query}")).status, 400
+            )
+        self.assertEqual((await self.client.get("/api/rate")).status, 401)
+
+    async def test_foreign_currency_expense_round_trips(self):
+        response = await self.request(
+            "POST",
+            f"/api/groups/{self.gid}/expenses",
+            json={
+                "amount_cents": 20000,
+                "orig_currency": "try",
+                "orig_amount_cents": 10000,
+                "description": "Museum",
+                "payer": 1,
+                "participants": [1, 2],
+                "operation_id": "operation-123456789",
+            },
+        )
+        eid = (await response.json())["id"]
+        stored = self.repo.get_expense(eid, self.gid)
+        self.assertEqual(
+            (stored["orig_currency"], stored["orig_amount_cents"]), ("TRY", 10000)
+        )
+        shown = await (
+            await self.request("GET", f"/api/groups/{self.gid}/expenses/{eid}")
+        ).json()
+        self.assertEqual(shown["orig_currency"], "TRY")
+        self.assertTrue(shown["can_edit"])
+
+    async def test_edit_belongs_to_the_author_and_checks_the_revision(self):
+        eid = self.repo.create_expense(
+            self.gid, 1, 1, "Dinner", 10000, {1: 5000, 2: 5000}
+        )
+        revision = self.repo.get_expense(eid, self.gid)["revision"]
+        body = {
+            "amount_cents": 30000,
+            "description": "Dinner for three",
+            "payer": 2,
+            "participants": [1, 2],
+            "shares": [10000, 20000],
+            "revision": revision,
+        }
+        path = f"/api/groups/{self.gid}/expenses/{eid}"
+        self.assertEqual(
+            (await self.request("POST", path, uid=2, json=body)).status, 403
+        )
+        self.assertEqual((await self.request("POST", path, json=body)).status, 200)
+        updated = self.repo.get_expense(eid, self.gid)
+        self.assertEqual(updated["amount_cents"], 30000)
+        self.assertEqual(updated["payer"], 2)
+        self.assertEqual(self.repo.get_expense_shares(eid), {1: 10000, 2: 20000})
+        # The stale revision is the one the client already saw.
+        self.assertEqual((await self.request("POST", path, json=body)).status, 400)
+        for broken in ({"shares": [1, 2]}, {"participants": [1, 3]}, {"payer": 3}):
+            self.assertEqual(
+                (
+                    await self.request(
+                        "POST", path, json={**body, **broken, "revision": revision + 1}
+                    )
+                ).status,
+                400,
+            )
+        self.assertEqual(self.repo.get_expense(eid, self.gid)["amount_cents"], 30000)
+
+    async def test_settings_rename_and_currency_are_owner_only(self):
+        path = f"/api/groups/{self.gid}/settings"
+        self.assertEqual(
+            (await self.request("POST", path, uid=2, json={"title": "Hijack"})).status,
+            403,
+        )
+        self.assertEqual(
+            (await self.request("POST", path, json={"title": "Trip 2026"})).status, 200
+        )
+        self.assertEqual(self.repo.get_group_title(self.gid), "Trip 2026")
+        self.assertEqual(
+            (await self.request("POST", path, json={"currency": "EUR"})).status, 200
+        )
+        self.assertEqual(self.repo.group_currency(self.gid), "EUR")
+        # Once money is recorded the base currency is frozen, but resending
+        # the current one must stay a no-op rather than an error.
+        self.repo.create_expense(self.gid, 1, 1, "Dinner", 10000, {1: 10000})
+        self.assertEqual(
+            (await self.request("POST", path, json={"currency": "EUR"})).status, 200
+        )
+        self.assertEqual(
+            (await self.request("POST", path, json={"currency": "USD"})).status, 400
+        )
+        self.assertEqual(self.repo.group_currency(self.gid), "EUR")
+
+    async def test_removing_a_member_and_leaving_respect_open_debts(self):
+        self.assertEqual(
+            (
+                await self.request("DELETE", f"/api/groups/{self.gid}/members/2", uid=2)
+            ).status,
+            403,
+        )
+        self.repo.create_expense(self.gid, 1, 1, "Dinner", 10000, {1: 5000, 2: 5000})
+        self.assertEqual(
+            (await self.request("DELETE", f"/api/groups/{self.gid}/members/2")).status,
+            400,
+        )
+        self.assertEqual(
+            (
+                await self.request("POST", f"/api/groups/{self.gid}/leave", json={})
+            ).status,
+            400,
+        )
+        self.repo.delete_expense(
+            self.repo.list_group_expenses(self.gid, 1, 0)[0]["id"], actor=1
+        )
+        self.assertEqual(
+            (await self.request("DELETE", f"/api/groups/{self.gid}/members/2")).status,
+            200,
+        )
+        self.assertEqual([m["id"] for m in self.repo.list_members(self.gid)], [1])
+        response = await self.request("POST", f"/api/groups/{self.gid}/leave", json={})
+        self.assertTrue((await response.json())["deleted"])
+        self.assertEqual(self.repo.list_user_groups(1), [])
+
+    async def test_group_payload_states_who_may_change_what(self):
+        payload = await (await self.request("GET", f"/api/groups/{self.gid}")).json()
+        self.assertTrue(payload["is_owner"])
+        self.assertTrue(payload["can_change_currency"])
+        self.assertEqual(
+            [(m["id"], m["role"]) for m in payload["members"]],
+            [(1, "owner"), (2, "member")],
+        )
+        self.repo.create_expense(self.gid, 1, 1, "Dinner", 10000, {1: 10000})
+        payload = await (
+            await self.request("GET", f"/api/groups/{self.gid}", uid=2)
+        ).json()
+        self.assertFalse(payload["is_owner"])
+        self.assertFalse(payload["can_change_currency"])
+
+
 if __name__ == "__main__":
     unittest.main()
