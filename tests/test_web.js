@@ -97,9 +97,22 @@ test("offline queue survives retryable errors and reports storage failures", asy
   globalThis.window = {};
   globalThis.localStorage = {getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value)};
   try {
-    const {enqueue, pending, flush, setQueueUser, updateQueued, removeQueued, legacyPending, importLegacyQueue} = await import("../web/lib/api.js");
+    const {api, enqueue, pending, flush, setQueueUser, updateQueued, removeQueued, legacyPending, importLegacyQueue} = await import("../web/lib/api.js");
     setQueueUser(1);
     const entry = {path: "/groups/1/expenses", body: {operation_id: "test-operation-123456", amount_cents: 100}};
+    await t.test("HTML proxy failures preserve the status and explain rejected uploads", async () => {
+      for (const status of [413, 429, 502, 504]) {
+        globalThis.fetch = async () => new Response('<html>proxy error</html>', {status, headers: {'Content-Type': 'text/html'}});
+        await assert.rejects(api('/groups/1/expenses/1/receipt?revision=1', 'POST', new Blob(['photo'], {type: 'image/png'})), error => {
+          assert.equal(error.status, status);
+          assert.match(error.message, new RegExp(`HTTP ${status}`));
+          if (status === 413) assert.match(error.message, /фото.*лимит/);
+          return true;
+        });
+      }
+      globalThis.fetch = async () => new Response(JSON.stringify({error: 'Specific server error'}), {status: 413});
+      await assert.rejects(api('/groups/1/expenses/1/receipt'), /Specific server error/);
+    });
     for (const status of [401, 408, 429, 500, 502, 503]) {
       await t.test(`HTTP ${status} preserves writes for a later successful retry`, async () => {
         storage.clear();

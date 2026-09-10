@@ -291,3 +291,19 @@ test('group editing and Excel download or Telegram delivery are available inside
   assert.ok(requests.some(r => r.path.endsWith('/export') && r.method === 'POST'));
   assert.match(await page.locator('#notice').innerText(), /Excel отправлен/);
 });
+
+test('an HTML upload rejection explains the size limit and preserves the selected receipt', async t => {
+  const {page} = await fixture(t);
+  await page.route('**/api/groups/1/expenses/1/receipt?*', route => route.fulfill({
+    status: 413, contentType: 'text/html', body: '<html><h1>413 Request Entity Too Large</h1></html>',
+  }));
+  await page.locator('.group').click();
+  await page.locator('.expense').first().click();
+  await page.getByLabel('Фото чека').setInputFiles({name: 'receipt.png', mimeType: 'image/png', buffer: Buffer.alloc(40000)});
+  await page.getByRole('button', {name: 'Прикрепить чек', exact: true}).click();
+  const message = await page.locator('#notice').innerText();
+  assert.match(message, /фото.*лимит/);
+  assert.match(message, /HTTP 413/);
+  assert.equal(await page.getByLabel('Фото чека').evaluate(node => node.files[0].name), 'receipt.png');
+  assert.equal(await page.locator('dialog').evaluate(node => node.open), true);
+});

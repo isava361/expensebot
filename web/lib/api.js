@@ -33,7 +33,19 @@ async function request(path, method = "GET", body, signal) {
   }
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    const failure = new Error(data.error || "Сервер недоступен. Попробуйте ещё раз.");
+    // Reverse proxies often return HTML, before the request reaches our API.
+    const receipt = path.split("?")[0].endsWith("/receipt");
+    const messages = {
+      401: "Откройте приложение заново из меню бота в Telegram.",
+      403: "Нет доступа к этому действию.",
+      413: receipt ? "Сервер отклонил фото: превышен лимит загрузки (HTTP 413)."
+        : "Сервер отклонил слишком большой запрос (HTTP 413).",
+      429: "Слишком много запросов. Подождите немного и повторите (HTTP 429).",
+      502: "Сервер временно недоступен (HTTP 502). Попробуйте ещё раз.",
+      504: "Сервер не успел ответить (HTTP 504). Попробуйте ещё раз.",
+    };
+    const failure = new Error((typeof data?.error === "string" && data.error)
+      || messages[response.status] || `Ошибка сервера (HTTP ${response.status}). Попробуйте ещё раз.`);
     failure.status = response.status;
     throw failure;
   }
