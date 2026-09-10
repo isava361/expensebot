@@ -250,8 +250,10 @@ test('receipt upload, preview, history, deletion and restoration work in the exp
   const {page, requests} = await fixture(t);
   await page.locator('.group').click();
   await page.locator('.expense').first().click();
-  await page.getByLabel('Фото чека').setInputFiles({name: 'receipt.jpg', mimeType: 'image/jpeg', buffer: Buffer.from([255, 216, 255, 1])});
-  await page.getByRole('button', {name: 'Прикрепить чек', exact: true}).click();
+  assert.equal(await page.getByLabel('Фото чека').isVisible(), false);
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser'),
+    page.getByRole('button', {name: 'Прикрепить чек', exact: true}).click()]);
+  await chooser.setFiles({name: 'receipt.jpg', mimeType: 'image/jpeg', buffer: Buffer.from([255, 216, 255, 1])});
   await page.getByRole('button', {name: 'Посмотреть чек'}).click();
   await page.locator('img.receipt-image').waitFor();
   if (process.env.MINIAPP_SCREENSHOTS) await page.screenshot({path: path.join(process.env.MINIAPP_SCREENSHOTS, 'receipt-new.png')});
@@ -299,11 +301,53 @@ test('an HTML upload rejection explains the size limit and preserves the selecte
   }));
   await page.locator('.group').click();
   await page.locator('.expense').first().click();
-  await page.getByLabel('Фото чека').setInputFiles({name: 'receipt.png', mimeType: 'image/png', buffer: Buffer.alloc(40000)});
-  await page.getByRole('button', {name: 'Прикрепить чек', exact: true}).click();
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser'),
+    page.getByRole('button', {name: 'Прикрепить чек', exact: true}).click()]);
+  await chooser.setFiles({name: 'receipt.png', mimeType: 'image/png', buffer: Buffer.alloc(40000)});
+  await page.waitForFunction(() => document.querySelector('#notice').textContent.includes('HTTP 413'));
   const message = await page.locator('#notice').innerText();
   assert.match(message, /фото.*лимит/);
   assert.match(message, /HTTP 413/);
   assert.equal(await page.getByLabel('Фото чека').evaluate(node => node.files[0].name), 'receipt.png');
   assert.equal(await page.locator('dialog').evaluate(node => node.open), true);
+});
+
+test('receipt picker supports cancellation, same-file retry, upload progress and replacement', async t => {
+  const {page, requests} = await fixture(t);
+  let attempts = 0, resume;
+  const paused = new Promise(resolve => { resume = resolve; });
+  await page.route('**/api/groups/1/expenses/1/receipt?*', async route => {
+    attempts++;
+    if (attempts === 1) return route.fulfill({status: 502, json: {error: 'Try this photo again'}});
+    await paused;
+    await route.fallback();
+  });
+  await page.locator('.group').click();
+  await page.locator('.expense').first().click();
+  const choose = async label => {
+    const [picker] = await Promise.all([page.waitForEvent('filechooser'),
+      page.getByRole('button', {name: label, exact: true}).click()]);
+    return picker;
+  };
+  if (process.env.MINIAPP_SCREENSHOTS) await page.screenshot({path: path.join(process.env.MINIAPP_SCREENSHOTS, 'receipt-picker.png')});
+  await (await choose('Прикрепить чек')).setFiles([]);
+  assert.equal(attempts, 0);
+  assert.equal(await page.getByRole('button', {name: 'Прикрепить чек', exact: true}).isEnabled(), true);
+
+  const photo = {name: 'same-photo.jpg', mimeType: 'image/jpeg', buffer: Buffer.from([255, 216, 255, 1])};
+  await (await choose('Прикрепить чек')).setFiles(photo);
+  await page.waitForFunction(() => document.querySelector('#notice').textContent.includes('Try this photo again'));
+  const retry = await choose('Прикрепить чек');
+  assert.equal(await page.getByLabel('Фото чека').evaluate(node => node.files.length), 0);
+  await retry.setFiles(photo);
+  await page.getByRole('button', {name: 'Загружаем чек…', exact: true}).waitFor();
+  assert.equal(await page.getByRole('button', {name: 'Загружаем чек…', exact: true}).isDisabled(), true);
+  resume();
+  await page.getByRole('button', {name: 'Заменить чек', exact: true}).waitFor();
+  assert.equal(attempts, 2);
+
+  await (await choose('Заменить чек')).setFiles({...photo, name: 'replacement.jpg'});
+  await page.waitForFunction(() => document.querySelector('.receipt-section input[type=file]').files.length === 0);
+  assert.equal(attempts, 3);
+  assert.equal(requests.filter(request => request.path.endsWith('/receipt') && request.method === 'POST').length, 2);
 });

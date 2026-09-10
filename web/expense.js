@@ -293,18 +293,49 @@ function receipts(box, group, expense, ctx) {
   else section.append(el("p", "Чек не прикреплён.", "hint"));
   section.append(preview);
   if (expense.can_edit) {
-    const file = field(section, "Фото чека", "file");
+    const file = el("input");
+    file.type = "file";
     file.accept = "image/jpeg,image/png";
-    section.append(el("p", "Фото появится в вашем чате с ботом Telegram. Участники группы смогут посмотреть его здесь. JPEG или PNG, до 10 МБ.", "hint"));
-    section.append(button(expense.has_receipt ? "Заменить чек" : "Прикрепить чек", async () => {
-      const photo = file.files[0];
-      if (!photo) throw new Error("Выберите фото чека.");
-      if (!["image/jpeg", "image/png"].includes(photo.type)) throw new Error("Выберите фото JPEG или PNG.");
-      if (photo.size > 10 * 1024 * 1024) throw new Error("Фото должно быть не больше 10 МБ.");
-      await api(`${path}?revision=${expense.revision}`, "POST", photo);
-      forget(); await ctx.reload(); await showExpense(group, expense.id, ctx);
-      notify("Чек сохранён в Telegram и прикреплён к трате");
-    }, "secondary wide"));
+    file.hidden = true;
+    file.setAttribute("aria-label", "Фото чека");
+    const label = expense.has_receipt ? "Заменить чек" : "Прикрепить чек";
+    const attach = el("button", label, "wide");
+    attach.type = "button";
+    let uploading = false;
+    attach.addEventListener("click", () => {
+      if (uploading) return;
+      haptic("light");
+      // Keep the picker in the click gesture; clearing lets the same photo
+      // trigger change again after an unsuccessful upload.
+      file.value = "";
+      file.click();
+    });
+    file.addEventListener("change", async () => {
+      const photo = file.files?.[0];
+      if (!photo || uploading) return;
+      uploading = true;
+      attach.disabled = true;
+      attach.textContent = "Загружаем чек…";
+      attach.setAttribute("aria-busy", "true");
+      try {
+        if (!["image/jpeg", "image/png"].includes(photo.type)) throw new Error("Выберите фото JPEG или PNG.");
+        if (photo.size > 10 * 1024 * 1024) throw new Error("Фото должно быть не больше 10 МБ.");
+        await api(`${path}?revision=${expense.revision}`, "POST", photo);
+        forget(); await ctx.reload();
+        if (section.isConnected) await showExpense(group, expense.id, ctx);
+        haptic("success");
+        notify("Чек сохранён в Telegram и прикреплён к трате");
+      } catch (error) {
+        haptic("error"); notify(error.message);
+      } finally {
+        uploading = false;
+        attach.disabled = false;
+        attach.textContent = label;
+        attach.removeAttribute("aria-busy");
+      }
+    });
+    section.append(file, attach,
+      el("p", "Выберите фото — оно загрузится автоматически и появится в вашем чате с ботом Telegram. Участники группы смогут посмотреть его здесь. JPEG или PNG, до 10 МБ.", "hint"));
     if (expense.has_receipt) section.append(button("Убрать чек из траты", () => ask(
       "Убрать чек из траты? Фото останется в вашем чате Telegram.", async () => {
         await api(`${path}?revision=${expense.revision}`, "DELETE");
