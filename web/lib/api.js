@@ -8,17 +8,18 @@ import {tg} from "./tg.js";
 const NO_NETWORK = "Нет связи с сервером. Проверьте интернет и повторите.";
 const cache = new Map();
 const QUEUE_KEY = "expensebot.pending";
+let queueUser = null, flushing = null;
 
-export async function api(path, method = "GET", body, signal) {
+async function request(path, method = "GET", body, signal) {
   let response;
   try {
     response = await fetch(`/api${path}`, {
       method,
       headers: {
         "Authorization": `tma ${tg?.initData || ""}`,
-        ...(body === undefined ? {} : {"Content-Type": "application/json"}),
+        ...(body === undefined ? {} : {"Content-Type": body instanceof Blob ? body.type : "application/json"}),
       },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined || body instanceof Blob ? body : JSON.stringify(body),
       cache: "no-store",
       signal,
     });
@@ -30,13 +31,23 @@ export async function api(path, method = "GET", body, signal) {
     offline.offline = true;
     throw offline;
   }
-  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
     const failure = new Error(data.error || "Сервер недоступен. Попробуйте ещё раз.");
     failure.status = response.status;
     throw failure;
   }
-  return data;
+  return response;
+}
+
+export async function api(path, method = "GET", body, signal) {
+  return (await request(path, method, body, signal)).json();
+}
+
+export async function apiFile(path) {
+  const response = await request(path);
+  const encoded = response.headers.get("Content-Disposition")?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  return {blob: await response.blob(), filename: encoded ? decodeURIComponent(encoded) : "expenses.xlsx"};
 }
 
 export const cached = path => cache.get(path);
@@ -48,45 +59,94 @@ export const forget = () => cache.clear();
 // -- offline queue ---------------------------------------------------------
 // Every write the app makes carries an operation_id the server treats as
 // idempotent, so replaying one that may already have landed is safe.
-const readQueue = () => {
-  try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]"); } catch { return []; }
+export function setQueueUser(uid) {
+  if (!Number.isSafeInteger(uid) || uid <= 0) throw new Error("Не удалось определить владельца очереди.");
+  queueUser = uid;
+}
+const queueKey = () => queueUser === null ? null : `${QUEUE_KEY}.${queueUser}`;
+const readQueue = (key = queueKey()) => {
+  if (!key) return [];
+  try {
+    const items = JSON.parse(localStorage.getItem(key) || "[]");
+    if (!Array.isArray(items)) throw new Error();
+    return items;
+  } catch { throw new Error("Не удалось прочитать очередь на устройстве. Проверьте доступ к хранилищу."); }
 };
-const writeQueue = items => {
-  try { localStorage.setItem(QUEUE_KEY, JSON.stringify(items)); }
+const writeQueue = (items, key = queueKey()) => {
+  if (!key) throw new Error("Откройте приложение заново из Telegram.");
+  try { localStorage.setItem(key, JSON.stringify(items)); }
   catch { throw new Error("Не удалось сохранить трату на устройстве. Не закрывайте форму: восстановите связь и повторите отправку."); }
 };
 
-export const pending = () => readQueue();
+// Browsing online still works when WebView storage is disabled. Mutations use
+// strict reads, so they cannot overwrite unreadable entries or claim a save.
+const availableQueue = key => { try { return readQueue(key); } catch { return []; } };
+export const pending = () => availableQueue(queueKey());
+export const legacyPending = () => availableQueue(QUEUE_KEY);
+export const queueBusy = () => Boolean(flushing);
+const editableQueue = () => { if (flushing) throw new Error("Дождитесь завершения отправки."); };
+
+export function importLegacyQueue() {
+  editableQueue();
+  const items = readQueue();
+  for (const entry of readQueue(QUEUE_KEY)) {
+    if (!items.some(item => item.body.operation_id === entry.body.operation_id)) items.push(entry);
+  }
+  writeQueue(items);
+  writeQueue([], QUEUE_KEY);
+}
 
 export function enqueue(entry) {
   const items = readQueue();
   if (items.some(item => item.body.operation_id === entry.body.operation_id)) return;
-  items.push(entry);
+  items.push({...entry, created_at: Date.now(), status: "waiting", error: ""});
+  writeQueue(items);
+}
+
+export function removeQueued(operation) {
+  editableQueue();
+  writeQueue(readQueue().filter(item => item.body.operation_id !== operation));
+}
+
+export function updateQueued(operation, body, metadata = {}) {
+  editableQueue();
+  const items = readQueue();
+  const item = items.find(entry => entry.body.operation_id === operation);
+  if (!item) throw new Error("Трата уже отправлена или удалена из очереди.");
+  item.body = {...body, operation_id: operation};
+  item.status = "waiting";
+  item.error = "";
+  if (metadata.currency) item.currency = metadata.currency;
+  if (metadata.group_title) item.group_title = metadata.group_title;
   writeQueue(items);
 }
 
 /** Replays queued writes oldest first; retryable failures leave the queue intact. */
-export async function flush() {
-  let items = readQueue();
-  let sent = 0, dropped = 0;
-  let errorMessage = "";
-  while (items.length) {
-    const [entry] = items;
+export function flush(operation = null) {
+  if (flushing) return flushing;
+  flushing = flushQueue(operation).finally(() => { flushing = null; });
+  return flushing;
+}
+
+async function flushQueue(operation) {
+  const key = queueKey();
+  let sent = 0, failed = 0, errorMessage = "";
+  const entries = readQueue(key).filter(entry => operation ? entry.body.operation_id === operation : entry.status !== "failed");
+  for (const entry of entries) {
+    if (queueKey() !== key) break;
     try {
       await api(entry.path, "POST", entry.body);
       sent++;
+      writeQueue(readQueue(key).filter(item => item.body.operation_id !== entry.body.operation_id), key);
+      forget();
     } catch (error) {
-      // Only explicit permanent rejections may discard a write. An expired
-      // login, throttling, server errors and unknown failures need a retry.
-      if (![400, 403, 404, 405, 413, 415, 422].includes(error.status)) {
-        errorMessage = error.message;
-        break;
-      }
-      dropped++;
+      failed++;
+      errorMessage = error.message;
+      const permanent = error.status >= 400 && error.status < 500 && ![401, 408, 429].includes(error.status);
+      writeQueue(readQueue(key).map(item => item.body.operation_id === entry.body.operation_id
+        ? {...item, status: permanent ? "failed" : "waiting", error: error.message} : item), key);
+      if (!permanent) break;
     }
-    items = readQueue().filter(item => item.body.operation_id !== entry.body.operation_id);
-    writeQueue(items);
   }
-  if (sent || dropped) forget();
-  return {sent, dropped, error: errorMessage};
+  return {sent, failed, error: errorMessage};
 }

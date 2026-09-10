@@ -8,17 +8,44 @@ import logging
 import re
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlsplit, quote
 
 from aiohttp import web
+from telegram.error import TelegramError
 
 from core import MAX_AMOUNT_CENTS, KNOWN_CURRENCIES, normalize_currency
+from workbook import build_group_workbook, export_filename
 
 STATIC = Path(__file__).with_name("web")
 # One or more lowercase path segments ending in a web extension: enough for
 # module folders, and no way to name a dotfile or climb out of web/.
 STATIC_NAME = re.compile(r"[a-z0-9_-]+(?:/[a-z0-9_-]+)*\.(?:html|js|css|map)")
 logger = logging.getLogger(__name__)
+RECEIPT_LIMIT = 10 * 1024 * 1024
+
+
+class InputError(ValueError):
+    """A safe, actionable message intended for the Mini App user."""
+
+
+def public_expense(expense):
+    result = dict(expense)
+    result["has_receipt"] = bool(result.pop("receipt", ""))
+    return result
+
+
+def expense_access(repo, uid, gid, eid, edit=False, revision=None):
+    with repo._lock:
+        if not repo.is_group_member(gid, uid):
+            raise web.HTTPForbidden()
+        expense = repo.get_expense(eid, gid, include_deleted=True)
+        if not expense:
+            raise web.HTTPNotFound()
+        if edit and (expense["created_by"] != uid or expense["deleted"]):
+            raise web.HTTPForbidden()
+        if revision is not None and expense["revision"] != revision:
+            raise InputError("Трата уже изменена. Откройте её заново.")
+        return expense
 
 
 def validate_init_data(raw, token, max_age=3600, now=None):
@@ -196,9 +223,19 @@ def dispatch(repo, user, method, path, body, query, bot=""):
             if not action(match[1], uid):
                 raise web.HTTPForbidden()
             return {"ok": True}
+        operation_match = re.fullmatch(
+            r"/api/groups/([0-9]+)/operations/([A-Za-z0-9_-]{16,64})", path
+        )
+        if operation_match and method == "GET":
+            gid = int(operation_match[1])
+            if not repo.is_group_member(gid, uid):
+                raise web.HTTPForbidden()
+            expense = repo.expense_by_operation(gid, uid, operation_match[2])
+            return {"expense": public_expense(expense) if expense else None}
         match = re.fullmatch(
             r"/api/groups/([0-9]+)"
-            r"(?:/(expenses|settings|leave|members)(?:/([0-9]+))?)?",
+            r"(?:/(expenses|settings|leave|members)(?:/([0-9]+))?)?"
+            r"(?:/(history|restore))?",
             path,
         )
         if not match:
@@ -206,7 +243,9 @@ def dispatch(repo, user, method, path, body, query, bot=""):
         gid = int(match[1])
         if not repo.is_group_member(gid, uid):
             raise web.HTTPForbidden()
-        section, item = match[2], match[3]
+        section, item, action = match[2], match[3], match[4]
+        if action and (section != "expenses" or not item):
+            raise web.HTTPNotFound()
         if not section and method == "GET":
             return {
                 "id": gid,
@@ -228,20 +267,16 @@ def dispatch(repo, user, method, path, body, query, bot=""):
         if section == "settings" and method == "POST":
             if not repo.is_group_owner(gid, uid):
                 raise web.HTTPForbidden()
-            if "title" in body and not repo.rename_group(
-                gid, string(body["title"], 100)
-            ):
-                raise ValueError("Не удалось переименовать группу.")
+            title = string(body["title"], 100) if "title" in body else None
+            currency = None
             if "currency" in body:
                 currency = normalize_currency(string(body["currency"], 3))
                 if not currency:
                     raise ValueError("Неизвестная валюта.")
-                if currency != repo.group_currency(gid) and not repo.set_group_currency(
-                    gid, currency
-                ):
-                    raise ValueError(
-                        "Валюту можно сменить, только пока в группе нет трат и платежей."
-                    )
+            try:
+                repo.update_group_settings(gid, uid, title, currency)
+            except ValueError as error:
+                raise InputError(str(error)) from None
             return {"ok": True}
         if section == "leave" and method == "POST":
             reason = repo.leave_group(gid, uid)
@@ -261,28 +296,51 @@ def dispatch(repo, user, method, path, body, query, bot=""):
             return {"ok": True}
         if section == "expenses" and not item:
             if method == "GET":
+                deleted = bool(integer(int(query.get("deleted", "0")), 0, 1))
                 offset = integer(int(query.get("offset", "0")), 0, 1000000)
                 search = query.get("q", "")[:100].strip()
                 payer = integer(int(query.get("payer", "0")), 0, 2**52 - 1)
                 if payer and not repo.is_group_member(gid, payer):
                     raise ValueError("Этот человек не в группе.")
                 expenses = repo.list_group_expenses(
-                    gid, 30, offset, query=search, payer=payer
+                    gid, 30, offset, deleted=deleted, query=search, payer=payer
                 )
-                for expense in expenses:
-                    expense.pop("receipt", None)
                 return {
-                    "expenses": expenses,
-                    "total": repo.count_group_expenses(gid, query=search, payer=payer),
+                    "expenses": [public_expense(e) for e in expenses],
+                    "total": repo.count_group_expenses(
+                        gid, deleted=deleted, query=search, payer=payer
+                    ),
                     "sum_cents": repo.sum_group_expenses(
-                        gid, query=search, payer=payer
+                        gid, query=search, payer=payer, deleted=deleted
                     ),
                 }
             if method == "POST":
+                if body.get(
+                    "group_currency", repo.group_currency(gid)
+                ) != repo.group_currency(gid):
+                    raise InputError(
+                        "Валюта группы изменилась. Откройте «Изменить» в очереди и проверьте сумму."
+                    )
                 payer, desc, amount, shares, orig, orig_amount = expense_fields(body)
                 operation = string(body.get("operation_id"), 64)
                 if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", operation):
                     raise ValueError("Некорректный идентификатор операции.")
+                previous = repo.expense_by_operation(gid, uid, operation)
+                if previous and (
+                    previous["deleted"]
+                    or (
+                        previous["payer"],
+                        previous["desc"],
+                        previous["amount_cents"],
+                        previous["shares"],
+                        previous["orig_currency"],
+                        previous["orig_amount_cents"],
+                    )
+                    != (payer, desc, amount, shares, orig, orig_amount)
+                ):
+                    raise web.HTTPConflict(
+                        reason="Трата уже отправлена и отличается от записи в очереди. Откройте «Изменить»."
+                    )
                 eid = repo.create_expense(
                     gid,
                     uid,
@@ -297,16 +355,62 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                 return {"id": eid}
         if section == "expenses" and item:
             eid = int(item)
-            expense = repo.get_expense(eid, gid)
+            expense = repo.get_expense(eid, gid, include_deleted=True)
             if not expense:
                 raise web.HTTPNotFound()
+            if action == "history" and method == "GET":
+                offset = integer(int(query.get("offset", "0")), 0, 1000000)
+                rows = repo.expense_history(eid, gid, uid, limit=21, offset=offset)
+                history, ids = [], set()
+                for record in rows[:20]:
+                    ids.add(record["actor_tg_id"])
+                    snapshots = {}
+                    for key in ("before", "after"):
+                        snapshot = (
+                            json.loads(record[f"{key}_json"])
+                            if record[f"{key}_json"]
+                            else None
+                        )
+                        snapshots[key] = public_expense(snapshot) if snapshot else None
+                        if snapshot:
+                            ids.update(
+                                (snapshot["payer"], *map(int, snapshot["shares"]))
+                            )
+                    history.append(
+                        dict(
+                            id=record["id"],
+                            actor=record["actor_tg_id"],
+                            action=record["action"],
+                            created_at=record["created_at"],
+                            **snapshots,
+                        )
+                    )
+                return {
+                    "history": history,
+                    "names": repo.names_for(ids),
+                    "more": len(rows) > 20,
+                }
+            if action == "restore" and method == "POST":
+                if expense["created_by"] != uid:
+                    raise web.HTTPForbidden()
+                try:
+                    repo.restore_expense(eid, gid, uid)
+                except ValueError as error:
+                    raise InputError(str(error)) from None
+                return {"ok": True}
+            if action:
+                raise web.HTTPMethodNotAllowed(
+                    method, ["GET" if action == "history" else "POST"]
+                )
             if method == "GET":
-                expense.pop("receipt", None)
                 return dict(
-                    expense,
+                    public_expense(expense),
                     shares=repo.get_expense_shares(eid),
                     can_edit=repo.can_edit_expense(eid, gid, uid),
+                    can_restore=expense["deleted"] and expense["created_by"] == uid,
                 )
+            if expense["deleted"]:
+                raise web.HTTPNotFound()
             if method == "POST":
                 if not repo.can_edit_expense(eid, gid, uid):
                     raise web.HTTPForbidden()
@@ -332,7 +436,9 @@ def dispatch(repo, user, method, path, body, query, bot=""):
         raise web.HTTPMethodNotAllowed(method, ["GET", "POST"])
 
 
-def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
+def create_web_app(
+    repo, token, url, max_age=3600, rates=None, bot="", telegram_bot=None
+):
     origin = validate_url(url)
     if not token or not 60 <= max_age <= 86400:
         raise ValueError("BOT_TOKEN and INIT_DATA_MAX_AGE (60..86400) required")
@@ -356,10 +462,25 @@ def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
                 401: "Откройте приложение заново из меню бота в Telegram.",
                 403: "Нет доступа к этому действию.",
                 404: "Запись не найдена.",
+                409: "Трата уже отправлена и отличается от записи в очереди. Откройте «Изменить».",
+                413: "Фото слишком большое. Выберите файл до 10 МБ."
+                if request.path.endswith("/receipt")
+                else "Слишком большой запрос.",
+                415: "Выберите фото в формате JPEG или PNG.",
             }
             response = web.json_response(
                 {"error": messages.get(error.status, "Некорректный запрос.")},
                 status=error.status,
+            )
+        except InputError as error:
+            response = web.json_response({"error": str(error)}, status=400)
+        except TelegramError:
+            # Telegram exceptions may contain download URLs with the bot token.
+            response = web.json_response(
+                {
+                    "error": "Telegram не принял запрос. Проверьте, что бот запущен в личном чате, и повторите. Для чека выберите обычное фото JPEG или PNG."
+                },
+                status=502,
             )
         except (ValueError, TypeError, KeyError):
             response = web.json_response(
@@ -379,7 +500,7 @@ def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
-                "Content-Security-Policy": "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors https://web.telegram.org https://*.telegram.org",
+                "Content-Security-Policy": "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors https://web.telegram.org https://*.telegram.org",
             }
         )
         return response
@@ -403,6 +524,92 @@ def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
             bot,
         )
         return web.json_response(result)
+
+    file_slots = asyncio.Semaphore(3)
+
+    async def receipt(request):
+        uid = request["user"]["id"]
+        gid, eid = int(request.match_info["gid"]), int(request.match_info["eid"])
+        revision = (
+            integer(int(request.query.get("revision", "-1")), 0, 2**31)
+            if request.method != "GET"
+            else None
+        )
+        expense = await asyncio.to_thread(
+            expense_access, repo, uid, gid, eid, request.method != "GET", revision
+        )
+        if request.method == "DELETE":
+            await asyncio.to_thread(repo.set_receipt, eid, gid, "", uid, revision)
+            return web.json_response({"ok": True})
+        if telegram_bot is None:
+            raise InputError("Хранение чеков в Telegram пока недоступно.")
+        async with file_slots:
+            if request.method == "GET":
+                if not expense["receipt"]:
+                    raise web.HTTPNotFound()
+                remote = await telegram_bot.get_file(expense["receipt"])
+                if remote.file_size and remote.file_size > RECEIPT_LIMIT:
+                    raise InputError("Этот чек слишком большой для просмотра.")
+                data = await remote.download_as_bytearray()
+                # Recheck membership after the network await.
+                await asyncio.to_thread(expense_access, repo, uid, gid, eid)
+                return web.Response(body=bytes(data), content_type="image/jpeg")
+            if request.content_type not in ("image/jpeg", "image/png"):
+                raise web.HTTPUnsupportedMediaType()
+            # read() enforces this limit even for a chunked upload. No temp files.
+            data = await request.clone(client_max_size=RECEIPT_LIMIT + 1).read()
+            if len(data) > RECEIPT_LIMIT:
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=RECEIPT_LIMIT, actual_size=len(data)
+                )
+            if not (
+                data.startswith(b"\xff\xd8\xff")
+                or data.startswith(b"\x89PNG\r\n\x1a\n")
+            ):
+                raise web.HTTPUnsupportedMediaType()
+            await asyncio.to_thread(expense_access, repo, uid, gid, eid, True, revision)
+            message = await telegram_bot.send_photo(
+                chat_id=uid,
+                photo=data,
+                caption=f"Чек к трате «{expense['desc']}» (№{eid})",
+                disable_notification=True,
+            )
+            try:
+                await asyncio.to_thread(
+                    repo.set_receipt, eid, gid, message.photo[-1].file_id, uid, revision
+                )
+            except ValueError:
+                raise InputError(
+                    "Фото сохранено в вашем чате Telegram, но трата уже изменилась. Откройте её заново и прикрепите чек ещё раз."
+                ) from None
+            return web.json_response({"ok": True})
+
+    def make_export(uid, gid):
+        with repo._lock:
+            if not repo.is_group_member(gid, uid):
+                raise web.HTTPForbidden()
+            data, tz = repo.export_group(gid), repo.user_tz(uid)
+        return build_group_workbook(data, tz), export_filename(gid, data["title"])
+
+    async def export(request):
+        uid, gid = request["user"]["id"], int(request.match_info["gid"])
+        data, filename = await asyncio.to_thread(make_export, uid, gid)
+        if request.method == "POST":
+            if telegram_bot is None:
+                raise InputError(
+                    "Отправка в Telegram пока недоступна. Используйте «Скачать»."
+                )
+            await telegram_bot.send_document(
+                chat_id=uid, document=data, filename=filename, disable_notification=True
+            )
+            return web.json_response({"ok": True})
+        return web.Response(
+            body=data,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"
+            },
+        )
 
     async def rate(request):
         """Outside `dispatch`: the provider call is async and must not hold the lock."""
@@ -440,16 +647,25 @@ def create_web_app(repo, token, url, max_age=3600, rates=None, bot=""):
     app = web.Application(middlewares=[security], client_max_size=32768)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/rate", rate)
+    for method in ("GET", "POST", "DELETE"):
+        app.router.add_route(
+            method, r"/api/groups/{gid:\d+}/expenses/{eid:\d+}/receipt", receipt
+        )
+    for method in ("GET", "POST"):
+        app.router.add_route(method, r"/api/groups/{gid:\d+}/export", export)
     app.router.add_route("*", "/api/{path:.*}", api)
     app.router.add_get("/", static)
     app.router.add_get("/{name:.*}", static)
     return app
 
 
-async def start_web(repo, token, url, port, max_age=3600, rates=None, bot=""):
+async def start_web(
+    repo, token, url, port, max_age=3600, rates=None, bot="", telegram_bot=None
+):
     integer(port, 1024, 65535)
     runner = web.AppRunner(
-        create_web_app(repo, token, url, max_age, rates, bot), access_log=None
+        create_web_app(repo, token, url, max_age, rates, bot, telegram_bot),
+        access_log=None,
     )
     await runner.setup()
     try:

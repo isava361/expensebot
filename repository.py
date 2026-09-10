@@ -626,10 +626,20 @@ class Repo:
 
     @atomic
     def set_receipt(
-        self, expense_id: int, group_id: int, file_id: str, actor=None
+        self,
+        expense_id: int,
+        group_id: int,
+        file_id: str,
+        actor=None,
+        expected_revision=None,
     ) -> None:
         with self._lock:
             before = self._editable_expense(expense_id, group_id, actor)
+            if (
+                expected_revision is not None
+                and before["revision"] != expected_revision
+            ):
+                raise ValueError("Трата уже изменена. Откройте её заново.")
             self._conn.execute(
                 "UPDATE expenses SET receipt_file_id=?, updated_at=?, revision=revision+1 WHERE id=? AND group_id=?",
                 (file_id or None, now_unix(), expense_id, group_id),
@@ -842,18 +852,44 @@ class Repo:
             ).fetchone()
         return row[0] if row else 0
 
-    def sum_group_expenses(self, group_id: int, query="", payer=0) -> int:
+    def sum_group_expenses(
+        self, group_id: int, query="", payer=0, deleted=False
+    ) -> int:
         """What the matching expenses add up to, for the list's own total."""
         narrow, extra = self._expense_filter(query, payer)
         with self._lock:
             row = self._conn.execute(
                 "SELECT COALESCE(SUM(amount_cents), 0) FROM expenses"
-                " WHERE group_id=? AND deleted=0" + narrow,
-                (group_id, *extra),
+                " WHERE group_id=? AND deleted=?" + narrow,
+                (group_id, deleted, *extra),
             ).fetchone()
         return row[0] if row else 0
 
     # -- balances --
+
+    def expense_by_operation(self, group_id, uid, operation):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM expenses WHERE group_id=? AND created_by_tg_id=? AND operation_id=?",
+                (group_id, uid, f"web:{uid}:{operation}"),
+            ).fetchone()
+            return (
+                self.get_expense(row["id"], group_id, include_deleted=True)
+                if row
+                else None
+            )
+
+    @atomic
+    def update_group_settings(self, group_id, uid, title=None, currency=None):
+        if not self.is_group_owner(group_id, uid):
+            raise ValueError("Менять настройки может только владелец группы.")
+        if currency and currency != self.group_currency(group_id):
+            if not self.set_group_currency(group_id, currency):
+                raise ValueError(
+                    "Валюту можно сменить, только пока в группе нет трат и платежей."
+                )
+        if title is not None and not self.rename_group(group_id, title):
+            raise ValueError("Не удалось переименовать группу.")
 
     def _net_positions(self, group_id: int) -> dict[int, int]:
         """Per-user balance in one group: positive = the group owes them."""

@@ -186,13 +186,26 @@ the API-installed menu button already launches the app with signed user data.
 
 ## App scope and security
 
-The Mini App includes groups, joining by code, group members/balances, paginated
-expenses, equal/custom shares with review, expense details/deletion, overall
-debts, partial payments and recipient confirmation. Editing, receipt attachment,
-history, restoration, group settings and Excel export remain in the bot chat.
+The Mini App includes groups and settings, joining by code, members/balances,
+paginated active/deleted expenses, equal/custom shares with review, editing,
+history, restoration, receipt attachment/viewing and Excel export, plus overall
+debts, partial payments and recipient confirmation. Its per-account offline
+queue retains failed entries for manual correction and retry.
 New Mini App writes appear there because both interfaces use the same repository.
-Mini App writes do not send chat notifications; recipients see pending payments
-in the Mini App or the bot's debts screen.
+Receipt uploads send a photo to the author's private bot chat and keep only
+the Telegram `file_id` in SQLite. Excel is sent to the requesting user's private
+chat only when they choose that action. Other Mini App writes do not send chat
+notifications; recipients see pending payments in the debts screen.
+
+When upgrading, apply the `/api/groups/.../expenses/.../receipt` location from
+`nginx-https.conf`: it allows 10 MiB photos and turns off both request and response
+buffering. Without it the previous 32 KiB limit rejects ordinary photos; buffering
+must stay disabled to avoid temporary receipt files on the server. Uploads and
+downloads in Python use memory only and share a three-request concurrency limit.
+The Bot instance is passed by `main.py`; no extra storage service or environment
+variable is required. The user must have started the bot in a private chat and
+must not have blocked it. Photo and Excel integration tests use a fake Bot and
+send no real Telegram messages.
 
 Every API request validates Telegram HMAC-SHA256, constant-time hash comparison,
 duplicate fields, user identity and `auth_date` (one hour by default, at most

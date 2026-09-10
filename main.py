@@ -135,6 +135,7 @@ def main() -> None:
                 # Share the bot's cache so the Mini App does not refetch rates.
                 bot_app.rates,
                 bot_app.base,
+                application.bot,
             )
         backup_task = asyncio.create_task(periodic_backup())
 

@@ -15,27 +15,63 @@ const group = {id: 1, title: 'Review fixture', currency: 'RUB', balance: 0,
   transfers: [], is_owner: true, can_change_currency: false};
 
 async function fixture(t) {
-  const context = await browser.newContext({timezoneId: 'Europe/Moscow'});
+  const context = await browser.newContext({timezoneId: 'Europe/Moscow', viewport: {width: 390, height: 844}});
   t.after(() => context.close());
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
   const writes = [];
+  const requests = [];
+  const activeGroup = structuredClone(group);
   const entries = Array.from({length: 31}, (_, i) => ({id: i + 1, desc: `Expense ${i}`,
     payer: 1, created_at: Date.UTC(2026, 8, 9, 12) / 1000, amount_cents: 100}));
+  const detail = {...entries[0], created_by: 1, shares: {1: 80, 2: 20}, revision: 1,
+    orig_currency: '', has_receipt: false, deleted: false, can_edit: true, can_restore: false};
+  const initial = structuredClone(detail);
   await page.addInitScript(() => { window.Telegram = {WebApp: {initData: 'fixture',
     ready() {}, expand() {}, BackButton: {show() {}, hide() {}, onClick() {}}}}; });
   await page.route('https://telegram.org/**', route => route.fulfill({body: ''}));
   await page.route('https://miniapp.test/**', async route => {
     const request = route.request(), url = new URL(request.url());
     if (url.pathname.startsWith('/api/')) {
+      requests.push({path: url.pathname, method: request.method()});
       let data = {};
-      if (request.method() === 'POST') { writes.push(request.postDataJSON()); data = {id: 7, ok: true}; }
+      if (url.pathname.endsWith('/receipt')) {
+        if (request.method() === 'POST') {
+          assert.match(request.headers()['content-type'], /^image\//);
+          assert.ok(request.postDataBuffer().length > 0);
+          detail.has_receipt = true; detail.revision++;
+          return route.fulfill({json: {ok: true}});
+        }
+        if (request.method() === 'DELETE') { detail.has_receipt = false; detail.revision++; return route.fulfill({json: {ok: true}}); }
+        return route.fulfill({contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')});
+      }
+      if (url.pathname.endsWith('/export') && request.method() === 'GET') {
+        return route.fulfill({body: Buffer.from('PK-test-workbook'), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          headers: {'Content-Disposition': "attachment; filename*=UTF-8''group-1.xlsx"}});
+      }
+      if (url.pathname.endsWith('/history')) data = {history: [
+        {id: 2, actor: 1, action: 'edit', created_at: detail.created_at, before: initial,
+          after: {...initial, amount_cents: 200, shares: {1: 160, 2: 40}}},
+      ], names: {1: 'Alice', 2: 'Bob'}, more: false};
+      else if (/\/operations\//.test(url.pathname)) data = {expense: null};
+      else if (url.pathname.endsWith('/restore')) {
+        detail.deleted = false; detail.can_edit = true; detail.can_restore = false; data = {ok: true};
+      }
+      else if (url.pathname === '/api/groups/1/expenses/1' && request.method() === 'DELETE') {
+        detail.deleted = true; detail.can_edit = false; detail.can_restore = true; data = {ok: true};
+      }
+      else if (url.pathname === '/api/groups/1/expenses/1' && request.method() === 'GET') data = detail;
+      else if (request.method() === 'POST') {
+        const body = request.postDataJSON(); writes.push(body); data = {id: 7, ok: true};
+        if (url.pathname.endsWith('/settings')) Object.assign(activeGroup, body);
+      }
       else if (url.pathname === '/api/me') data = {user: {id: 1}, currencies: ['RUB', 'USD', 'EUR']};
-      else if (url.pathname === '/api/groups') data = {groups: [group]};
-      else if (url.pathname === '/api/groups/1') data = group;
+      else if (url.pathname === '/api/groups') data = {groups: [activeGroup]};
+      else if (url.pathname === '/api/groups/1') data = activeGroup;
       else if (url.pathname === '/api/groups/1/expenses') {
         const offset = Number(url.searchParams.get('offset') || 0);
-        const filtered = url.searchParams.get('payer') === '2' ? [] : entries;
+        const deleted = url.searchParams.get('deleted') === '1';
+        const filtered = url.searchParams.get('payer') === '2' ? [] : entries.filter(entry => (entry.id === 1 && detail.deleted) === deleted);
         data = {expenses: filtered.slice(offset, offset + 30), total: filtered.length, sum_cents: filtered.length * 100};
       }
       return route.fulfill({json: data});
@@ -50,7 +86,7 @@ async function fixture(t) {
     window.testGroup = group;
     window.testContext = {me: {id: 1}, currencies: ['RUB', 'USD', 'EUR'], reload: async () => {}};
   }, group);
-  return {page, writes};
+  return {page, writes, requests, activeGroup};
 }
 
 async function form(page, existing = null) {
@@ -155,13 +191,14 @@ test('day subtotal grows across pages and resets when filters change', async t =
   await page.locator('.group').click();
   await page.locator('.expense').first().waitFor();
   await page.getByRole('button', {name: 'Показать ещё'}).click();
+  await page.locator('.expense').nth(30).waitFor();
   assert.equal(await page.locator('.expense').count(), 31);
   assert.equal(await page.locator('.day').count(), 1);
   assert.match(await page.locator('.day .amount').innerText(), /^31,00/);
-  await page.locator('.filters select').selectOption('2');
+  await page.getByLabel('Кто платил', {exact: true}).selectOption('2');
   await page.getByText('Ничего не нашлось.', {exact: false}).waitFor();
   assert.equal(await page.locator('.day').count(), 0);
-  await page.locator('.filters select').selectOption('0');
+  await page.getByLabel('Кто платил', {exact: true}).selectOption('0');
   await page.locator('.expense').first().waitFor();
   assert.match(await page.locator('.day .amount').innerText(), /^30,00/);
 });
@@ -174,4 +211,83 @@ test('Moscow dates straddling midnight get separate matching day labels', async 
       .map(day => ({key: day.key, label: dayLabel(day.at, 'ru', Date.parse('2026-09-10T09:00:00Z')), total: day.total}));
   });
   assert.deepEqual(days, [{key: '2026-09-10', label: 'Сегодня', total: 100}, {key: '2026-09-09', label: 'Вчера', total: 100}]);
+});
+
+test('queue entries can be corrected, retried and explicitly removed', async t => {
+  const {page, writes} = await fixture(t);
+  await page.evaluate(async () => {
+    const {enqueue} = await import('/lib/api.js');
+    enqueue({path: '/groups/1/expenses', currency: 'RUB', group_title: 'Review fixture',
+      body: {operation_id: 'browser-queue-operation', description: 'Queued coffee', amount_cents: 10000,
+        payer: 1, participants: [1, 2], shares: [8000, 2000]}});
+  });
+  await page.getByRole('button', {name: 'Обновить'}).click();
+  await page.getByRole('button', {name: 'Открыть очередь'}).click();
+  await page.getByRole('button', {name: 'Изменить', exact: true}).click();
+  await page.getByLabel('За что платили?').fill('Corrected coffee');
+  await page.getByRole('button', {name: 'Проверить трату'}).click();
+  await page.getByRole('button', {name: 'Сохранить изменения'}).click();
+  await page.getByRole('heading', {name: 'Очередь отправки'}).waitFor();
+  assert.match(await page.locator('dialog').innerText(), /Corrected coffee/);
+  if (process.env.MINIAPP_SCREENSHOTS) await page.screenshot({path: path.join(process.env.MINIAPP_SCREENSHOTS, 'queue-new.png')});
+  assert.equal(writes.length, 0);
+  await page.getByRole('button', {name: 'Повторить', exact: true}).click();
+  await page.getByText('Неотправленных трат нет.', {exact: true}).waitFor();
+  assert.deepEqual(writes[0].shares, [8000, 2000]);
+  assert.equal(writes[0].description, 'Corrected coffee');
+  await page.evaluate(async () => {
+    const {enqueue} = await import('/lib/api.js');
+    enqueue({path: '/groups/1/expenses', body: {operation_id: 'remove-queue-operation', description: 'Remove me', amount_cents: 100, payer: 1, participants: [1]}});
+    const {showQueue} = await import('/queue.js'); showQueue(window.testContext);
+  });
+  await page.getByRole('button', {name: 'Удалить', exact: true}).click();
+  await page.getByRole('button', {name: 'Да', exact: true}).click();
+  await page.getByText('Неотправленных трат нет.', {exact: true}).waitFor();
+  assert.equal(writes.length, 1);
+});
+
+test('receipt upload, preview, history, deletion and restoration work in the expense card', async t => {
+  const {page, requests} = await fixture(t);
+  await page.locator('.group').click();
+  await page.locator('.expense').first().click();
+  await page.getByLabel('Фото чека').setInputFiles({name: 'receipt.jpg', mimeType: 'image/jpeg', buffer: Buffer.from([255, 216, 255, 1])});
+  await page.getByRole('button', {name: 'Прикрепить чек', exact: true}).click();
+  await page.getByRole('button', {name: 'Посмотреть чек'}).click();
+  await page.locator('img.receipt-image').waitFor();
+  if (process.env.MINIAPP_SCREENSHOTS) await page.screenshot({path: path.join(process.env.MINIAPP_SCREENSHOTS, 'receipt-new.png')});
+  assert.ok(requests.some(r => r.path.endsWith('/receipt') && r.method === 'POST'));
+  assert.ok(requests.some(r => r.path.endsWith('/receipt') && r.method === 'GET'));
+  await page.getByRole('button', {name: 'История изменений'}).click();
+  await page.locator('.history-event').waitFor();
+  const history = await page.locator('.history-event').innerText();
+  if (process.env.MINIAPP_SCREENSHOTS) await page.screenshot({path: path.join(process.env.MINIAPP_SCREENSHOTS, 'history-new.png')});
+  assert.match(history, /Alice/); assert.match(history, /1,00.*2,00/); assert.match(history, /Доля: Bob/);
+  await page.getByRole('button', {name: '‹ К трате'}).click();
+  await page.getByRole('button', {name: 'Удалить трату', exact: true}).click();
+  await page.getByRole('button', {name: 'Да', exact: true}).click();
+  await page.getByRole('heading', {name: 'Трата удалена'}).waitFor();
+  await page.getByRole('button', {name: 'Закрыть', exact: true}).click();
+  await page.getByLabel('Статус трат').selectOption('1');
+  await page.locator('.expense').first().click();
+  await page.getByRole('button', {name: 'Восстановить трату'}).click();
+  await page.getByRole('button', {name: 'Изменить', exact: true}).waitFor();
+  assert.ok(requests.some(r => r.path.endsWith('/restore') && r.method === 'POST'));
+});
+
+test('group editing and Excel download or Telegram delivery are available inside the app', async t => {
+  const {page, writes, requests, activeGroup} = await fixture(t);
+  activeGroup.can_change_currency = true;
+  await page.locator('.group').click();
+  await page.getByRole('button', {name: 'Редактировать группу', exact: true}).click();
+  await page.getByLabel('Название', {exact: true}).fill('Renamed group');
+  await page.getByLabel('Валюта группы').selectOption('EUR');
+  await page.getByRole('button', {name: 'Сохранить', exact: true}).click();
+  await page.getByRole('heading', {name: 'Renamed group', exact: true}).waitFor();
+  assert.deepEqual(writes[0], {title: 'Renamed group', currency: 'EUR'});
+  await page.getByRole('button', {name: 'Экспорт Excel'}).click();
+  const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', {name: 'Скачать Excel'}).click()]);
+  assert.equal(download.suggestedFilename(), 'group-1.xlsx');
+  await page.getByRole('button', {name: 'Получить в Telegram'}).click();
+  assert.ok(requests.some(r => r.path.endsWith('/export') && r.method === 'POST'));
+  assert.match(await page.locator('#notice').innerText(), /Excel отправлен/);
 });

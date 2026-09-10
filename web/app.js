@@ -3,7 +3,7 @@
 "use strict";
 
 import {money, groupIcon, byDay, dayLabel, amount} from "./lib/money.js";
-import {api, cached, remember, forget, pending, flush} from "./lib/api.js";
+import {api, apiFile, cached, remember, forget, pending, flush, setQueueUser, legacyPending} from "./lib/api.js";
 import {
   el, button, row, field, select, notify, primary, openModal, closeModal, modalOpen,
   ask, onModalClose, skeletons, failure, cardList,
@@ -13,12 +13,14 @@ import {
   resizeViewport, guardTouches, paintTheme, setMainErrorHandler,
 } from "./lib/tg.js";
 import {expenseForm, showExpense} from "./expense.js";
+import {showQueue} from "./queue.js";
 
 const app = document.querySelector("#app");
 const cash = (cents, currency) => money(cents, currency, locale);
 let me, bot = "", currencies = [], currentGroup = null, currentTab = "groups", request = null;
+let retryWhenClosed = false;
 
-const ctx = () => ({me, currencies, reload: () => showGroup(currentGroup)});
+const ctx = () => ({me, currencies, reload: () => refresh()});
 
 // -- screen shell ----------------------------------------------------------
 // A screen paints from the last known answer at once when it has one, then
@@ -65,18 +67,17 @@ function heading(text, ...extra) {
 /** Anything still waiting to reach the server, with a way to push it now. */
 function queueBanner() {
   const waiting = pending();
-  if (!waiting.length) return null;
+  if (!waiting.length && !legacyPending().length) return null;
   const box = el("div", undefined, "card queued");
-  box.append(el("span", `${waiting.length} ${waiting.length === 1 ? "трата ждёт" : "траты ждут"} отправки`));
-  box.append(button("Отправить", sendQueued, "quiet"));
+  box.append(el("span", waiting.length ? `В очереди: ${waiting.length}` : "Есть старая очередь на устройстве"));
+  box.append(button("Открыть очередь", () => showQueue(ctx()), "quiet"));
   return box;
 }
 
 async function sendQueued() {
-  const {sent, dropped, error} = await flush();
+  const {sent, failed, error} = await flush();
   if (sent) notify(sent === 1 ? "Отложенная трата отправлена" : `Отправлено трат: ${sent}`);
-  if (dropped) notify("Часть отложенных трат сервер не принял — они удалены из очереди.");
-  if (sent || dropped) await refresh();
+  if (sent || failed) await refresh();
   if (error) notify(`${error} Неотправленные траты остаются на устройстве.`);
 }
 
@@ -165,9 +166,12 @@ const showGroup = id => {
     if (!tg?.MainButton) actions.append(button("+ Добавить трату", () => expenseForm(group, null, ctx())));
     actions.append(
       button("Пригласить", () => invite(group), "secondary"),
-      button("Настройки", () => groupSettings(group), "secondary"),
+      button(group.is_owner ? "Редактировать группу" : "Участники и настройки", () => groupSettings(group), "secondary"),
+      button("Экспорт Excel", () => exportGroup(group), "secondary"),
     );
     app.append(actions);
+    const banner = queueBanner();
+    if (banner) app.append(banner);
 
     // Who owes whom inside this group, already chained. Settling is netted
     // across every shared group, so it happens on the debts tab.
@@ -199,6 +203,12 @@ function expenses(group, signal) {
     .forEach(([value, name]) => { const option = el("option", name); option.value = value; payer.append(option); });
   bar.append(search, payer);
   const summary = el("p", "", "muted list-summary");
+  const deleted = el("select");
+  deleted.setAttribute("aria-label", "Статус трат");
+  [["0", "Действующие"], ["1", "Удалённые"]].forEach(([value, label]) => {
+    const option = el("option", label); option.value = value; deleted.append(option);
+  });
+  bar.append(deleted);
   const list = el("div");
   const more = button("Показать ещё", () => page(), "secondary wide");
   section.append(el("h2", "Траты"), bar, summary, list, more);
@@ -207,7 +217,7 @@ function expenses(group, signal) {
   async function page(reset = false) {
     const mine = ++token;
     if (reset) { offset = 0; lastDay = null; list.replaceChildren(); }
-    const query = `?offset=${offset}&q=${encodeURIComponent(search.value.trim())}&payer=${payer.value}`;
+    const query = `?offset=${offset}&q=${encodeURIComponent(search.value.trim())}&payer=${payer.value}&deleted=${deleted.value}`;
     const data = await api(`/groups/${group.id}/expenses${query}`, "GET", undefined, signal);
     if (mine !== token) return;
     summary.textContent = data.total
@@ -216,7 +226,7 @@ function expenses(group, signal) {
     if (!data.total) {
       list.replaceChildren(el("div", search.value.trim() || payer.value !== "0"
         ? "Ничего не нашлось. Измените запрос или выберите другого плательщика."
-        : "Трат пока нет. Добавьте первую общую покупку.", "empty"));
+        : deleted.value === "1" ? "Удалённых трат нет." : "Трат пока нет. Добавьте первую общую покупку.", "empty"));
     }
     byDay(data.expenses).forEach(day => {
       if (day.key !== lastDay?.key) {
@@ -247,6 +257,7 @@ function expenses(group, signal) {
   const rerun = () => page(true).catch(error => { if (!signal.aborted) notify(error.message); });
   search.addEventListener("input", () => { clearTimeout(rerun.timer); rerun.timer = setTimeout(rerun, 300); });
   payer.addEventListener("change", rerun);
+  deleted.addEventListener("change", rerun);
   rerun();
   return section;
 }
@@ -285,7 +296,7 @@ function invite(group) {
 }
 
 function groupSettings(group) {
-  const box = openModal("Настройки группы");
+  const box = openModal(group.is_owner ? "Редактировать группу" : "Участники и настройки");
   if (group.is_owner) {
     const title = field(box, "Название", "text", group.title);
     title.maxLength = 100;
@@ -296,6 +307,7 @@ function groupSettings(group) {
       box.append(el("p", `Валюта группы — ${group.currency}. Сменить её можно, только пока в группе нет ни трат, ни платежей: все суммы уже записаны в ней.`, "hint"));
     }
     primary(box, "Сохранить", async () => {
+      if (!title.value.trim()) throw new Error("Введите название группы.");
       await api(`/groups/${group.id}/settings`, "POST", {
         title: title.value,
         ...(currency ? {currency: currency.value} : {}),
@@ -337,6 +349,22 @@ function groupSettings(group) {
       await showGroups();
     },
   ), "danger wide"));
+}
+
+function exportGroup(group) {
+  const box = openModal("Экспорт Excel");
+  box.append(el("p", `Траты, доли участников и расчёты группы «${group.title}» в одном файле.`));
+  primary(box, "Скачать Excel", async () => {
+    const {blob, filename} = await apiFile(`/groups/${group.id}/export`);
+    const url = URL.createObjectURL(blob);
+    const link = el("a", "Скачать файл"); link.href = url; link.download = filename;
+    box.append(link); link.click();
+    setTimeout(() => { URL.revokeObjectURL(url); link.remove(); }, 60000);
+  });
+  box.append(button("Получить в Telegram", async () => {
+    await api(`/groups/${group.id}/export`, "POST", {});
+    notify("Excel отправлен в ваш чат с ботом");
+  }, "secondary wide"));
 }
 
 // -- debts -----------------------------------------------------------------
@@ -426,14 +454,23 @@ const refresh = () => {
 document.querySelector("#groups-tab").onclick = () => showGroups();
 document.querySelector("#debts-tab").onclick = () => showDebts();
 document.querySelector("#close-modal").onclick = () => closeModal();
-onModalClose(() => backState(currentGroup !== null));
+onModalClose(() => {
+  backState(currentGroup !== null);
+  if (retryWhenClosed) {
+    retryWhenClosed = false;
+    if (navigator.onLine && pending().some(entry => entry.status !== "failed")) sendQueued().catch(() => {});
+  }
+});
 setMainErrorHandler(error => notify(error.message));
 tg?.BackButton.onClick(() => { if (modalOpen()) closeModal(); else if (currentGroup !== null) showGroups(); });
 guardTouches(document.querySelector("#modal"));
 window.visualViewport?.addEventListener("resize", resizeViewport);
 window.visualViewport?.addEventListener("scroll", resizeViewport);
 window.addEventListener("resize", resizeViewport);
-window.addEventListener("online", () => { sendQueued().catch(() => {}); });
+window.addEventListener("online", () => {
+  if (modalOpen()) retryWhenClosed = true;
+  else sendQueued().catch(() => {});
+});
 resizeViewport();
 
 (async () => {
@@ -452,6 +489,7 @@ resizeViewport();
   const start = async () => {
     const data = await api("/me");
     me = data.user;
+    setQueueUser(me.id);
     bot = data.bot || "";
     currencies = data.currencies;
     if (pending().length) sendQueued().catch(() => {});

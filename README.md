@@ -47,8 +47,25 @@ The Mini App covers groups, invites, expenses (create, edit and delete, in the
 group's currency or a foreign one converted at the day's rate), group settings
 (rename, base currency while the group is empty, remove a member, leave) and
 the debts screen with payments. It drives Telegram's own main and back buttons
-and haptics rather than drawing its own chrome. Expense history, receipt photos
-and Excel export have no Mini App screen yet and stay in the chat with the bot.
+and haptics rather than drawing its own chrome. Expense cards include change
+history, receipt photos and restoration; the list can show deleted expenses.
+Group settings allow the owner to rename the group, change its currency while
+empty and remove members. Excel reports can be downloaded or sent to the user's
+private bot chat.
+
+The offline queue is scoped to the signed Telegram user on each device. Each
+entry shows its group, amount and latest error and can be retried, edited or
+removed. Rejected writes stay available for correction. Editing checks whether
+a previous attempt already reached the ledger, so a lost response does not
+silently discard changes or create a duplicate. Old queues without an account
+binding require the user to explicitly import their own entries.
+
+Receipt photos (JPEG/PNG, up to 10 MiB) are sent to the author's private Telegram
+bot chat. SQLite stores only Telegram's `file_id`; viewing the photo requires
+group membership. Upload and download use memory, with no local receipt files.
+The receipt location in `deploy/nginx-https.conf` disables request and response
+buffering to disk. Apply that updated location when deploying this feature.
+Removing an attachment from an expense does not delete its Telegram message.
 
 1. Install Python 3.11+.
 2. Create a Telegram bot with `@BotFather` and copy the token.
@@ -354,7 +371,8 @@ node --test tests/test_web.js
 ```
 
 Browser regressions cover expense editing, concurrent currency conversions,
-storage failures, pagination and local dates. They use mocked API responses
+storage failures, queue management, receipts, history/restoration, group settings,
+Excel downloads, pagination and local dates. They use mocked API responses
 and do not connect to Telegram or a database. Install the optional browser
 test dependency and run:
 

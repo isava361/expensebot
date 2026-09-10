@@ -98,6 +98,7 @@ export function ask(question, action) {
 
 export function onModalClose(handler) {
   modal.addEventListener("close", () => {
+    if (modal.open) return; // A queued close event must not clear a newly opened dialog.
     setPageLocked(false);
     modalBody.replaceChildren();
     restoreMain();

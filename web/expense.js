@@ -6,7 +6,7 @@
 "use strict";
 
 import {amount, money, equalShares, partShares} from "./lib/money.js";
-import {api, enqueue} from "./lib/api.js";
+import {api, apiFile, enqueue, forget} from "./lib/api.js";
 import {el, button, row, field, select, primary, openModal, closeModal, ask, notify} from "./lib/dom.js";
 import {haptic, locale, bindMain} from "./lib/tg.js";
 
@@ -190,20 +190,30 @@ export function expenseForm(group, existing, ctx) {
   }
 
   async function save(payload) {
+    if (ctx.saveQueued) {
+      await ctx.saveQueued(payload);
+      closeModal();
+      notify("Изменения сохранены в очереди");
+      await reload();
+      return;
+    }
     const path = existing ? `/groups/${group.id}/expenses/${existing.id}` : `/groups/${group.id}/expenses`;
-    const body = existing ? {...payload, revision: existing.revision} : {...payload, operation_id: operation};
+    const body = existing ? {...payload, revision: existing.revision}
+      : {...payload, operation_id: operation, group_currency: group.currency};
     try {
       await api(path, "POST", body);
     } catch (error) {
       // A create carries an idempotent operation_id, so replaying it later is
       // safe. An edit is tied to a revision that will have moved on.
       if (!error.offline || existing) throw error;
-      enqueue({path, body});
+      enqueue({path, body, group_title: group.title, currency: group.currency});
       closeModal();
       notify("Нет связи — трата сохранена на устройстве и уйдёт, как только связь появится.");
       await reload();
       return;
     }
+    forget();
+    await ctx.afterSave?.();
     closeModal();
     haptic("success");
     notify(existing ? "Трата обновлена" : "Трата сохранена");
@@ -237,11 +247,107 @@ export async function showExpense(group, id, ctx) {
   box.append(el("p", `Заплатил(а): ${paid} · ${day(expense.created_at)}`));
   Object.entries(expense.shares).forEach(([uid, share]) =>
     box.append(row(group.members.find(member => member.id === Number(uid))?.name || uid, cash(share, group.currency))));
-  box.append(el("p", "История правок и чеки — в чате с ботом.", "muted"));
+  box.append(button("История изменений", () => showHistory(group, expense, ctx), "secondary wide"));
+  receipts(box, group, expense, ctx);
+  if (expense.deleted) {
+    box.append(el("p", "Трата удалена и не участвует в расчёте долгов.", "hint"));
+    if (expense.can_restore) primary(box, "Восстановить трату", () => restoreExpense(group, id, ctx));
+    else box.append(el("p", "Восстановить трату может её автор.", "hint"));
+    return;
+  }
   if (!expense.can_edit) return;
   primary(box, "Изменить", async () => expenseForm(group, expense, ctx));
   box.append(button("Удалить трату", () => ask(
-    `Удалить «${expense.desc}» на ${cash(expense.amount_cents, group.currency)}? Долги пересчитаются, а восстановить трату можно в чате с ботом.`,
-    async () => { await api(`/groups/${group.id}/expenses/${id}`, "DELETE"); closeModal(); haptic("success"); await ctx.reload(); },
+    `Удалить «${expense.desc}» на ${cash(expense.amount_cents, group.currency)}? Долги пересчитаются. Трату можно будет восстановить.`,
+    async () => {
+      await api(`/groups/${group.id}/expenses/${id}`, "DELETE");
+      forget(); closeModal(); haptic("success"); await ctx.reload();
+      const undo = openModal("Трата удалена");
+      undo.append(el("p", `«${expense.desc}» больше не влияет на долги. Позже её можно найти в группе через фильтр «Удалённые».`));
+      primary(undo, "Восстановить трату", () => restoreExpense(group, id, ctx));
+    },
   ), "wide danger"));
+}
+
+async function restoreExpense(group, id, ctx) {
+  await api(`/groups/${group.id}/expenses/${id}/restore`, "POST", {});
+  forget(); closeModal(); haptic("success"); await ctx.reload();
+  await showExpense(group, id, ctx);
+  notify("Трата восстановлена");
+}
+
+function receipts(box, group, expense, ctx) {
+  const section = el("section", undefined, "receipt-section");
+  section.append(el("h3", "Чек"));
+  const preview = el("div");
+  const path = `/groups/${group.id}/expenses/${expense.id}/receipt`;
+  if (expense.has_receipt) section.append(button("Посмотреть чек", async () => {
+    const {blob} = await apiFile(path);
+    if (!section.isConnected) return;
+    const img = el("img", undefined, "receipt-image"); img.alt = `Чек: ${expense.desc}`;
+    const url = URL.createObjectURL(blob);
+    img.onload = () => { URL.revokeObjectURL(url); img.scrollIntoView({block: "nearest"}); };
+    img.onerror = () => { URL.revokeObjectURL(url); notify("Не удалось показать фото. Попробуйте открыть чек ещё раз."); };
+    img.src = url; preview.replaceChildren(img);
+  }, "secondary wide"));
+  else section.append(el("p", "Чек не прикреплён.", "hint"));
+  section.append(preview);
+  if (expense.can_edit) {
+    const file = field(section, "Фото чека", "file");
+    file.accept = "image/jpeg,image/png";
+    section.append(el("p", "Фото появится в вашем чате с ботом Telegram. Участники группы смогут посмотреть его здесь. JPEG или PNG, до 10 МБ.", "hint"));
+    section.append(button(expense.has_receipt ? "Заменить чек" : "Прикрепить чек", async () => {
+      const photo = file.files[0];
+      if (!photo) throw new Error("Выберите фото чека.");
+      if (!["image/jpeg", "image/png"].includes(photo.type)) throw new Error("Выберите фото JPEG или PNG.");
+      if (photo.size > 10 * 1024 * 1024) throw new Error("Фото должно быть не больше 10 МБ.");
+      await api(`${path}?revision=${expense.revision}`, "POST", photo);
+      forget(); await ctx.reload(); await showExpense(group, expense.id, ctx);
+      notify("Чек сохранён в Telegram и прикреплён к трате");
+    }, "secondary wide"));
+    if (expense.has_receipt) section.append(button("Убрать чек из траты", () => ask(
+      "Убрать чек из траты? Фото останется в вашем чате Telegram.", async () => {
+        await api(`${path}?revision=${expense.revision}`, "DELETE");
+        forget(); await ctx.reload(); await showExpense(group, expense.id, ctx);
+      },
+    ), "danger wide"));
+  }
+  box.append(section);
+}
+
+async function showHistory(group, expense, ctx) {
+  const box = openModal("История изменений");
+  box.append(button("‹ К трате", () => showExpense(group, expense.id, ctx), "quiet"));
+  const list = el("div"); box.append(list);
+  let offset = 0;
+  const titles = {create: "Трата добавлена", edit: "Трата изменена", delete: "Трата удалена", restore: "Трата восстановлена", receipt: "Чек обновлён"};
+  async function load() {
+    const data = await api(`/groups/${group.id}/expenses/${expense.id}/history?offset=${offset}`);
+    if (!box.isConnected) return;
+    const name = uid => data.names[uid] || String(uid);
+    for (const event of data.history) {
+      const card = el("div", undefined, "card history-event");
+      card.append(el("h3", titles[event.action] || "Изменение"),
+        el("p", `${name(event.actor)} · ${new Date(event.created_at * 1000).toLocaleString(locale)}`, "muted"));
+      const before = event.before, after = event.after;
+      const change = (label, oldValue, newValue) => {
+        if (oldValue !== newValue) card.append(row(label, oldValue === undefined ? String(newValue) : `${oldValue} → ${newValue}`));
+      };
+      change("Описание", before?.desc, after.desc);
+      change("Сумма", before && cash(before.amount_cents, group.currency), cash(after.amount_cents, group.currency));
+      change("Заплатил(а)", before && name(before.payer), name(after.payer));
+      const original = item => item?.orig_currency ? cash(item.orig_amount_cents, item.orig_currency) : "—";
+      if (before) change("В исходной валюте", original(before), original(after));
+      const ids = new Set([...Object.keys(before?.shares || {}), ...Object.keys(after.shares)]);
+      for (const uid of ids) change(`Доля: ${name(uid)}`,
+        before ? (uid in before.shares ? cash(before.shares[uid], group.currency) : "не участвовал(а)") : undefined,
+        uid in after.shares ? cash(after.shares[uid], group.currency) : "не участвовал(а)");
+      list.append(card);
+    }
+    offset += data.history.length;
+    more.hidden = !data.more;
+    if (!offset) list.append(el("p", "Изменений пока нет.", "hint"));
+  }
+  const more = button("Показать ещё", load, "secondary wide"); box.append(more);
+  await load();
 }

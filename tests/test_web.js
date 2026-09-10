@@ -97,7 +97,8 @@ test("offline queue survives retryable errors and reports storage failures", asy
   globalThis.window = {};
   globalThis.localStorage = {getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value)};
   try {
-    const {enqueue, pending, flush} = await import("../web/lib/api.js");
+    const {enqueue, pending, flush, setQueueUser, updateQueued, removeQueued, legacyPending, importLegacyQueue} = await import("../web/lib/api.js");
+    setQueueUser(1);
     const entry = {path: "/groups/1/expenses", body: {operation_id: "test-operation-123456", amount_cents: 100}};
     for (const status of [401, 408, 429, 500, 502, 503]) {
       await t.test(`HTTP ${status} preserves writes for a later successful retry`, async () => {
@@ -105,9 +106,9 @@ test("offline queue survives retryable errors and reports storage failures", asy
         enqueue(entry);
         globalThis.fetch = async () => new Response("{}", {status});
         const result = await flush();
-        assert.equal(result.dropped, 0);
+        assert.equal(result.failed, 1);
         assert.ok(result.error);
-        assert.deepEqual(pending(), [entry]);
+        assert.deepEqual(pending().map(item => item.body), [entry.body]);
         globalThis.fetch = async (_url, options) => {
           assert.deepEqual(JSON.parse(options.body), entry.body);
           return new Response('{"id":7}');
@@ -120,20 +121,64 @@ test("offline queue survives retryable errors and reports storage failures", asy
       storage.clear();
       enqueue(entry);
       globalThis.fetch = async () => { throw new TypeError("Network failed"); };
-      assert.equal((await flush()).dropped, 0);
-      assert.deepEqual(pending(), [entry]);
+      assert.equal((await flush()).failed, 1);
+      assert.deepEqual(pending().map(item => item.body), [entry.body]);
       enqueue({...entry, body: {...entry.body, operation_id: "test-operation-654321"}});
       let calls = 0;
       globalThis.fetch = async () => new Response("{}", {status: ++calls === 1 ? 400 : 200});
-      assert.deepEqual(await flush(), {sent: 1, dropped: 1, error: ""});
+      const result = await flush();
+      assert.equal(result.sent, 1);
+      assert.equal(result.failed, 1);
+      assert.equal(pending().length, 1);
+      assert.equal(pending()[0].status, "failed");
+      assert.ok(pending()[0].error);
+      updateQueued(entry.body.operation_id, {...entry.body, amount_cents: 200});
+      globalThis.fetch = async () => new Response('{"id":7}');
+      assert.equal((await flush()).sent, 1);
       assert.deepEqual(pending(), []);
+    });
+    await t.test("accounts are isolated and legacy entries require explicit import", async () => {
+      storage.clear();
+      setQueueUser(1); enqueue(entry);
+      setQueueUser(2);
+      assert.deepEqual(pending(), []);
+      let calls = 0;
+      globalThis.fetch = async () => { calls++; return new Response('{"id":7}'); };
+      await flush(); assert.equal(calls, 0);
+      storage.set("expensebot.pending", JSON.stringify([entry]));
+      assert.equal(legacyPending().length, 1);
+      await flush(); assert.equal(calls, 0);
+      importLegacyQueue(); assert.equal(pending().length, 1);
+      assert.equal(legacyPending().length, 0);
+      removeQueued(entry.body.operation_id); assert.equal(pending().length, 0);
+      setQueueUser(1); assert.equal(pending().length, 1);
+    });
+    await t.test("simultaneous flushes share one request and block edits while sending", async () => {
+      storage.clear(); enqueue(entry);
+      let finish, calls = 0;
+      globalThis.fetch = () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+      const first = flush(), second = flush();
+      assert.equal(first, second);
+      assert.throws(() => updateQueued(entry.body.operation_id, entry.body), /Дождитесь/);
+      assert.throws(() => removeQueued(entry.body.operation_id), /Дождитесь/);
+      finish(new Response('{"id":7}'));
+      await first;
+      assert.equal(calls, 1);
+      assert.equal(pending().length, 0);
     });
     await t.test("storage failure is reported and never erases an existing queue", () => {
       storage.clear();
       enqueue(entry);
       globalThis.localStorage.setItem = () => { throw new Error("Quota exceeded"); };
       assert.throws(() => enqueue({...entry, body: {...entry.body, operation_id: "another-operation-123"}}), /Не удалось сохранить/);
-      assert.deepEqual(pending(), [entry]);
+      assert.deepEqual(pending().map(item => item.body), [entry.body]);
+    });
+    await t.test("disabled storage does not break online screens or pretend to save", () => {
+      globalThis.localStorage.getItem = () => { throw new Error("Storage disabled"); };
+      assert.deepEqual(pending(), []);
+      assert.deepEqual(legacyPending(), []);
+      assert.throws(() => enqueue(entry), /Не удалось прочитать/);
+      assert.throws(() => importLegacyQueue(), /Не удалось прочитать/);
     });
   } finally {
     for (const [key, value] of Object.entries(previous)) {
