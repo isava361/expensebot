@@ -12,3 +12,4 @@ bot_state.pickle
 deploy/*.tar.gz
 .ui-check/
 node_modules/
+.claude/settings.local.json
