@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import sqlite3
 import tempfile
@@ -283,6 +284,66 @@ class RepoTest(unittest.TestCase):
         repo.delete_settlement(settlement_id, gid)
         self.assertEqual(repo.count_group_settlements(gid), 0)
         self.assertEqual(repo.compute_group_balances(gid), {(2, 1): 500})
+
+
+class BestNameTest(unittest.TestCase):
+    def test_own_name_comes_before_the_username(self):
+        repo = main.Repo(":memory:")
+        self.addCleanup(repo.close)
+        app = main.App(repo, "bot")
+        for first, last, username, expected in [
+            ("Иван", "Тест", "ivan", "Иван Тест"),
+            ("Иван", None, "ivan", "Иван"),
+            (None, "Тест", None, "Тест"),
+            ("", None, "ivan", "@ivan"),
+            (None, None, None, "7"),
+        ]:
+            user = types.SimpleNamespace(
+                id=7, first_name=first, last_name=last, username=username
+            )
+            self.assertEqual(app._best_name(user), expected)
+
+    def test_refresh_rereads_stored_names_from_telegram(self):
+        import refresh_names
+        from telegram.error import BadRequest
+
+        people = {
+            1: types.SimpleNamespace(
+                id=1, first_name="Иван", last_name="Тест", username="ivan"
+            ),
+            2: types.SimpleNamespace(
+                id=2, first_name="", last_name=None, username="olya"
+            ),
+        }
+
+        class Telegram:
+            async def get_chat(self, uid):
+                if uid not in people:
+                    raise BadRequest("Chat not found")
+                return people[uid]
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "data.db")
+            repo = main.Repo(path)
+            for uid, name in [(1, "@ivan"), (2, "@olya"), (3, "@gone")]:
+                repo.upsert_user(uid, name)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                dry = asyncio.run(refresh_names.refresh(Telegram(), path, True))
+                self.assertEqual(repo.user_name(1), "@ivan")
+                done = asyncio.run(refresh_names.refresh(Telegram(), path))
+            self.assertEqual(dry, (1, 1))
+            self.assertEqual(done, (1, 1))
+            self.assertEqual(
+                [repo.user_name(uid) for uid in (1, 2, 3)],
+                ["Иван Тест", "@olya", "@gone"],
+            )
+            self.assertNotIn("Chat not found", out.getvalue())
+            repo.close()
+            with self.assertRaises(sqlite3.OperationalError):
+                asyncio.run(
+                    refresh_names.refresh(Telegram(), str(Path(folder) / "typo.db"))
+                )
+            self.assertFalse((Path(folder) / "typo.db").exists())
 
 
 class KeyboardTest(unittest.TestCase):

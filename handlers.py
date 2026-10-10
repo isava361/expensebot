@@ -159,12 +159,15 @@ class App:
         self.base = bot_username
         self.rates = rates if rates is not None else Rates()
 
-    def _best_name(self, user) -> str:
-        if user.username:
-            return "@" + user.username
+    @staticmethod
+    def _best_name(user) -> str:
+        # The person's own name first, as the Mini App stores it: otherwise
+        # the same user is renamed each time they switch between the two.
         parts = [user.first_name or "", user.last_name or ""]
-        name = " ".join(p for p in parts if p).strip()
-        return name or str(user.id)
+        name = " ".join(p for p in parts if p).strip()[:200]
+        if name:
+            return name
+        return "@" + user.username if user.username else str(user.id)
 
     def _groups_page_keyboard(
         self, uid: int, page: int, mode: str
