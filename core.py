@@ -359,14 +359,18 @@ def settle_net(net: dict[int, int]) -> dict[tuple[int, int], int]:
 
     Debts are chained through intermediaries, not just netted pairwise: if
     A owes B and B owes C, B drops out and A pays C directly. The greedy
-    largest-debtor/largest-creditor matching keeps the number of transfers
-    small and is deterministic for a given ``net``, which matters because
-    the payment buttons carry the computed amount and are re-validated
-    against a freshly computed balance.
+    matching keeps the number of transfers small and is deterministic for a
+    given ``net``, which matters because the payment buttons carry the
+    computed amount and are re-validated against a freshly computed balance.
+
+    Small debtors go first to the largest creditor. Starting with the
+    largest debtor would let one big debt fill that creditor alone and send
+    everyone else to somebody they never shared a bill with; the person
+    owed the most is usually the one who just paid.
     """
     debtors = sorted(
         ((uid, -v) for uid, v in net.items() if v < 0),
-        key=lambda t: (-t[1], t[0]),
+        key=lambda t: (t[1], t[0]),
     )
     creditors = sorted(
         ((uid, v) for uid, v in net.items() if v > 0),

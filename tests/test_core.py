@@ -108,6 +108,18 @@ class SettleNetTest(unittest.TestCase):
         result = main.settle_net({1: -150, 2: 50, 3: 100})
         self.assertEqual(result, {(1, 3): 100, (1, 2): 50})
 
+    def test_small_debtors_pay_the_largest_creditor_first(self):
+        # 1 paid for dinner while 4 already owed more than 1 is due in all:
+        # 3's share still goes to 1, not to the other creditor.
+        self.assertEqual(
+            main.settle_net({1: 3530750, 2: 387492, 3: -254000, 4: -3664242}),
+            {(3, 1): 254000, (4, 1): 3276750, (4, 2): 387492},
+        )
+        self.assertEqual(
+            main.settle_net({1: -700, 2: -300, 3: 250, 4: 750}),
+            {(2, 4): 300, (1, 4): 450, (1, 3): 250},
+        )
+
     def test_pure_chain_removes_the_middleman(self):
         # A owes B 50 and B owes C 50 -> A pays C directly, B drops out.
         self.assertEqual(main.settle_net({1: -50, 2: 0, 3: 50}), {(1, 3): 50})
