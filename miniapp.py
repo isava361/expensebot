@@ -16,7 +16,12 @@ from urllib.parse import parse_qsl, urlsplit, quote
 from aiohttp import web
 from telegram.error import TelegramError
 
-from core import MAX_AMOUNT_CENTS, KNOWN_CURRENCIES, normalize_currency
+from core import (
+    MAX_AMOUNT_CENTS,
+    KNOWN_CURRENCIES,
+    display_name,
+    normalize_currency,
+)
 from workbook import build_group_workbook, export_filename
 
 STATIC = Path(__file__).with_name("web")
@@ -85,8 +90,15 @@ def validate_init_data(raw, token, max_age=3600, now=None):
             or not 0 < user["id"] < 2**52
         ):
             raise ValueError()
-        name = " ".join(user.get(k, "") for k in ("first_name", "last_name")).strip()
-        return {"id": user["id"], "name": name[:200] or str(user["id"])}
+        first, last, username = (
+            user.get(k, "") for k in ("first_name", "last_name", "username")
+        )
+        if not all(isinstance(value, str) for value in (first, last, username)):
+            raise ValueError()
+        return {
+            "id": user["id"],
+            "name": display_name(first, last, username, user["id"]),
+        }
     except (ValueError, KeyError, TypeError, UnicodeError):
         raise ValueError(
             "Откройте приложение заново из меню бота в Telegram."

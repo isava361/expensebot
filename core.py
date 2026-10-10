@@ -309,6 +309,19 @@ def split_message(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
+def display_name(first, last, username, uid) -> str:
+    """One spelling of a person for the bot and the Mini App alike.
+
+    A first name alone is rarely unique in a group, so it carries the
+    username; with a surname the name stands by itself.
+    """
+    first, last = (first or "").strip(), (last or "").strip()
+    name = " ".join(part for part in (first, last) if part)
+    if username and not last:
+        name = f"{name} (@{username})" if name else "@" + username
+    return name[:200] or str(uid)
+
+
 def rand_code() -> str:
     b = secrets.token_bytes(8)
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()

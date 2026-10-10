@@ -42,6 +42,20 @@ class InitDataTest(unittest.TestCase):
             "Иван + & = Тест",
         )
 
+    def test_username_marks_only_a_name_without_a_surname(self):
+        for user, expected in [
+            ({"id": 7, "first_name": "Иван", "username": "ivan"}, "Иван (@ivan)"),
+            ({"id": 7, "first_name": "Иван"}, "Иван"),
+            (
+                {"id": 7, "first_name": "Иван", "last_name": "Тест", "username": "i"},
+                "Иван Тест",
+            ),
+            ({"id": 7, "first_name": "", "username": "ivan"}, "@ivan"),
+            ({"id": 7}, "7"),
+        ]:
+            raw = signed(user=json.dumps(user, ensure_ascii=False))
+            self.assertEqual(validate_init_data(raw, TOKEN)["name"], expected)
+
     def test_tampering_other_bot_expiry_future_duplicates_and_bad_user(self):
         cases = [
             "",
@@ -55,6 +69,7 @@ class InitDataTest(unittest.TestCase):
             signed(user='{"id":true}'),
             signed(user='{"id":0}'),
             signed(user='{"id":1,"first_name":null}'),
+            signed(user='{"id":1,"first_name":"A","username":5}'),
             "user=%FF&hash=a",
         ]
         for raw in cases:

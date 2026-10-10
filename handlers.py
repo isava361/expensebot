@@ -36,6 +36,7 @@ from core import (
     format_time,
     split_message,
     rand_code,
+    display_name,
     extract_start_code_from_text,
     extract_bare_code,
 )
@@ -161,13 +162,9 @@ class App:
 
     @staticmethod
     def _best_name(user) -> str:
-        # The person's own name first, as the Mini App stores it: otherwise
-        # the same user is renamed each time they switch between the two.
-        parts = [user.first_name or "", user.last_name or ""]
-        name = " ".join(p for p in parts if p).strip()[:200]
-        if name:
-            return name
-        return "@" + user.username if user.username else str(user.id)
+        # Spelled as the Mini App spells it: otherwise the same user is
+        # renamed each time they switch between the two.
+        return display_name(user.first_name, user.last_name, user.username, user.id)
 
     def _groups_page_keyboard(
         self, uid: int, page: int, mode: str

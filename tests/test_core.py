@@ -287,13 +287,15 @@ class RepoTest(unittest.TestCase):
 
 
 class BestNameTest(unittest.TestCase):
-    def test_own_name_comes_before_the_username(self):
+    def test_username_marks_only_a_name_without_a_surname(self):
         repo = main.Repo(":memory:")
         self.addCleanup(repo.close)
         app = main.App(repo, "bot")
         for first, last, username, expected in [
             ("Иван", "Тест", "ivan", "Иван Тест"),
-            ("Иван", None, "ivan", "Иван"),
+            ("Иван", None, "ivan", "Иван (@ivan)"),
+            ("Иван", None, None, "Иван"),
+            (" Иван ", " ", "ivan", "Иван (@ivan)"),
             (None, "Тест", None, "Тест"),
             ("", None, "ivan", "@ivan"),
             (None, None, None, "7"),
