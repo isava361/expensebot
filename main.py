@@ -136,6 +136,9 @@ def main() -> None:
                 bot_app.rates,
                 bot_app.base,
                 application.bot,
+                # Passed as written: start_web refuses a half-set pair.
+                os.environ.get("AGENT_API_KEY", ""),
+                os.environ.get("AGENT_USER_ID", ""),
             )
         backup_task = asyncio.create_task(periodic_backup())
 

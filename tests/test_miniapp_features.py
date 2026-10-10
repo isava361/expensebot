@@ -112,6 +112,40 @@ class MiniAppFeaturesTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(self.repo.get_expense(self.eid, self.gid)["receipt"])
 
+    async def test_agent_key_attaches_and_removes_a_receipt_for_its_user(self):
+        key = "agent-key-for-feature-tests-0123456789"
+        client = TestClient(
+            TestServer(
+                create_web_app(
+                    self.repo,
+                    TOKEN,
+                    "https://test.example",
+                    telegram_bot=self.bot,
+                    agent_key=key,
+                    agent_user_id="1",
+                )
+            )
+        )
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        path = self.expense + f"/receipt?revision={self.revision}"
+        response = await client.post(
+            path,
+            data=PHOTO,
+            headers={"Authorization": "agent " + key, "Content-Type": "image/jpeg"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.bot.send_photo.call_args.kwargs["chat_id"], 1)
+        self.assertEqual(
+            self.repo.get_expense(self.eid, self.gid)["receipt"], "telegram-photo-id"
+        )
+        response = await client.delete(
+            self.expense + f"/receipt?revision={self.revision + 1}",
+            headers={"Authorization": "agent " + key},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertFalse(self.repo.get_expense(self.eid, self.gid)["receipt"])
+
     async def test_receipt_permissions_size_type_and_revision_are_checked_before_sending(
         self,
     ):

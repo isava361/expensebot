@@ -1,4 +1,7 @@
-"""Loopback-only Mini App HTTP server; all ledger access uses signed Telegram users."""
+"""Loopback-only Mini App HTTP server; all ledger access uses signed Telegram users.
+
+The one exception is the optional agent key, which acts for a single
+configured user with a narrower set of rights."""
 
 import asyncio
 import hashlib
@@ -105,6 +108,25 @@ def validate_url(url):
     return f"https://{parsed.netloc}"
 
 
+def agent_settings(key, user_id):
+    """Both empty turns agent access off; a half-set pair must stop the start."""
+    key, user_id = str(key or ""), str(user_id or "").strip()
+    if not key and not user_id:
+        return b"", 0
+    # Printable ASCII without spaces: anything else cannot arrive intact in a
+    # header. The message names the variables and never echoes the key.
+    if (
+        not re.fullmatch(r"[\x21-\x7e]{32,}", key)
+        or not re.fullmatch(r"[0-9]{1,16}", user_id)
+        or not 0 < int(user_id) < 2**52
+    ):
+        raise ValueError(
+            "AGENT_API_KEY (32+ printable ASCII characters, no spaces) and "
+            "AGENT_USER_ID (a positive Telegram id) must be set together"
+        )
+    return key.encode(), int(user_id)
+
+
 def integer(value, minimum=1, maximum=MAX_AMOUNT_CENTS):
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError("Некорректное число.")
@@ -156,11 +178,21 @@ def expense_fields(body):
     return payer, desc, amount, shares, orig_currency, orig_amount
 
 
-def dispatch(repo, user, method, path, body, query, bot=""):
+def dispatch(repo, user, method, path, body, query, bot="", agent=False):
     """Run under one repository lock, including authorization and subsequent reads/writes."""
     uid = user["id"]
+
+    def in_person():
+        # Refused where the action is taken rather than by matching paths up
+        # front: the group route accepts more spellings than it advertises.
+        if agent:
+            raise web.HTTPForbidden()
+
     with repo._lock:
-        repo.upsert_user(uid, user["name"])
+        if not agent:
+            # The agent's name was read from this table; writing it back
+            # could only undo a rename that happened in between.
+            repo.upsert_user(uid, user["name"])
         if path == "/api/me" and method == "GET":
             return {
                 "user": user,
@@ -180,6 +212,7 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                     ]
                 }
             if method == "POST":
+                in_person()
                 title = string(body.get("title"), 100)
                 currency = normalize_currency(string(body.get("currency"), 3))
                 if not currency:
@@ -187,6 +220,7 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                 gid, _ = repo.create_group(title, uid, currency)
                 return {"id": gid}
         if path == "/api/join" and method == "POST":
+            in_person()
             gid, _ = repo.join_by_code(string(body.get("code"), 64), uid)
             return {"id": gid}
         if path == "/api/debts" and method == "GET":
@@ -215,6 +249,7 @@ def dispatch(repo, user, method, path, body, query, bot=""):
             return {"batch": batch}
         match = re.fullmatch(r"/api/payments/([A-Za-z0-9_-]+)/(confirm|reject)", path)
         if match and method == "POST":
+            in_person()
             action = (
                 repo.confirm_settlement
                 if match[2] == "confirm"
@@ -265,6 +300,7 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                 ],
             }
         if section == "settings" and method == "POST":
+            in_person()
             if not repo.is_group_owner(gid, uid):
                 raise web.HTTPForbidden()
             title = string(body["title"], 100) if "title" in body else None
@@ -279,6 +315,7 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                 raise InputError(str(error)) from None
             return {"ok": True}
         if section == "leave" and method == "POST":
+            in_person()
             reason = repo.leave_group(gid, uid)
             if reason not in ("", "last"):
                 raise ValueError(
@@ -286,6 +323,7 @@ def dispatch(repo, user, method, path, body, query, bot=""):
                 )
             return {"ok": True, "deleted": reason == "last"}
         if section == "members" and item and method == "DELETE":
+            in_person()
             if not repo.is_group_owner(gid, uid):
                 raise web.HTTPForbidden()
             reason = repo.remove_member(gid, int(item))
@@ -437,11 +475,20 @@ def dispatch(repo, user, method, path, body, query, bot=""):
 
 
 def create_web_app(
-    repo, token, url, max_age=3600, rates=None, bot="", telegram_bot=None
+    repo,
+    token,
+    url,
+    max_age=3600,
+    rates=None,
+    bot="",
+    telegram_bot=None,
+    agent_key="",
+    agent_user_id="",
 ):
     origin = validate_url(url)
     if not token or not 60 <= max_age <= 86400:
         raise ValueError("BOT_TOKEN and INIT_DATA_MAX_AGE (60..86400) required")
+    agent_key, agent_uid = agent_settings(agent_key, agent_user_id)
 
     @web.middleware
     async def security(request, handler):
@@ -451,9 +498,19 @@ def create_web_app(
                     raise web.HTTPForbidden()
                 auth = request.headers.get("Authorization", "")
                 try:
-                    if not auth.startswith("tma "):
+                    if agent_key and auth.startswith("agent "):
+                        # Bytes: compare_digest refuses non-ASCII strings.
+                        if not hmac.compare_digest(auth[6:].encode(), agent_key):
+                            raise ValueError()
+                        name = await asyncio.to_thread(repo.stored_user_name, agent_uid)
+                        if name is None:
+                            raise web.HTTPForbidden()
+                        request["user"] = {"id": agent_uid, "name": name}
+                        request["via_agent"] = True
+                    elif auth.startswith("tma "):
+                        request["user"] = validate_init_data(auth[4:], token, max_age)
+                    else:
                         raise ValueError()
-                    request["user"] = validate_init_data(auth[4:], token, max_age)
                 except ValueError:
                     raise web.HTTPUnauthorized() from None
             response = await handler(request)
@@ -522,6 +579,7 @@ def create_web_app(
             body,
             dict(request.query),
             bot,
+            request.get("via_agent", False),
         )
         return web.json_response(result)
 
@@ -660,11 +718,30 @@ def create_web_app(
 
 
 async def start_web(
-    repo, token, url, port, max_age=3600, rates=None, bot="", telegram_bot=None
+    repo,
+    token,
+    url,
+    port,
+    max_age=3600,
+    rates=None,
+    bot="",
+    telegram_bot=None,
+    agent_key="",
+    agent_user_id="",
 ):
     integer(port, 1024, 65535)
     runner = web.AppRunner(
-        create_web_app(repo, token, url, max_age, rates, bot, telegram_bot),
+        create_web_app(
+            repo,
+            token,
+            url,
+            max_age,
+            rates,
+            bot,
+            telegram_bot,
+            agent_key,
+            agent_user_id,
+        ),
         access_log=None,
     )
     await runner.setup()

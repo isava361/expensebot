@@ -181,12 +181,17 @@ class Repo:
                 "UPDATE users SET tz_offset_min=? WHERE tg_id=?", (offset_min, uid)
             )
 
-    def user_name(self, uid: int) -> str:
+    def stored_user_name(self, uid: int):
+        """None for someone the ledger has never seen; `user_name` shows the id."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT name FROM users WHERE tg_id=?", (uid,)
             ).fetchone()
-        return row["name"] if row else str(uid)
+        return row["name"] if row else None
+
+    def user_name(self, uid: int) -> str:
+        name = self.stored_user_name(uid)
+        return str(uid) if name is None else name
 
     # -- groups --
 

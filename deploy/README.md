@@ -216,6 +216,30 @@ used. Expired initData requires reopening the app. Ledger permissions are
 checked on the server, under the same lock as the operation. Expense operation
 IDs prevent retrying a save from writing the same expense twice.
 
+### Optional agent key
+
+To let one personal agent use the API as a single user, add both lines to
+`/etc/expensebot/expensebot.env` and restart the service:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # the key
+# AGENT_API_KEY=<the key>
+# AGENT_USER_ID=<that user's Telegram id>
+sudo systemctl restart expensebot
+sudo systemctl status expensebot --no-pager
+curl -H "Authorization: agent $KEY" https://expense.ivansavelyev.ru:8443/api/me
+```
+
+The last command must answer 200 with that user's name; 403 means the user has
+not opened the bot yet. A half-set pair, a key shorter than 32 characters or a
+non-numeric id stops the service at start, so check its status after the
+restart. The key grants fewer rights than the user has (no group management,
+no confirming or rejecting payments) and never replaces `BOT_TOKEN`, which the
+agent must not receive. Pass the key to the agent in its own environment
+(`EXPENSEBOT_URL`, `EXPENSEBOT_AGENT_KEY`), keep it out of chats and shell
+history, and rotate it by editing the file and restarting. See
+[Agent access](../README.md#agent-access).
+
 References: [Telegram validation and Mini Apps](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app),
 [Certbot webroot and renewal](https://eff-certbot.readthedocs.io/en/stable/using.html),
 [Nginx reload behavior](https://nginx.org/en/docs/control.html).

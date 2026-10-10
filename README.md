@@ -108,7 +108,43 @@ Optional environment variables:
   (one day), must be positive. An existing database is also backed up before
   startup migrations; another snapshot starts when the bot connects.
 
+- `INIT_DATA_MAX_AGE`: seconds a Mini App `initData` signature stays valid,
+  60 to 86400, defaults to 3600.
+- `AGENT_API_KEY` and `AGENT_USER_ID`: optional API access for one personal
+  agent, see [Agent access](#agent-access). Set both or neither; the Mini App
+  refuses to start on a half-set pair, a key shorter than 32 characters or an
+  id that is not a positive integer.
+
 Commands: `/start`, `/join <код>`, `/cancel`, `/tz <смещение>`.
+
+## Agent access
+
+A separate server-side agent cannot produce Telegram `initData`, and it must
+not be given `BOT_TOKEN`: that token signs `initData` for any user and controls
+the bot. Instead, `AGENT_API_KEY` (32 or more printable ASCII characters, no
+spaces) lets it call the Mini App API as the single user named by
+`AGENT_USER_ID`:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+curl -H "Authorization: agent $KEY" https://<MINIAPP_URL>/api/me
+```
+
+- The user must already be known to the bot (have opened it or the Mini App);
+  otherwise every request is answered 403. The agent never creates the user
+  and never changes the stored name.
+- A wrong key, or any `agent` header while the mode is off, gets the same 401
+  as a missing `initData`. The `Origin` check applies as it does to the app.
+- The key acts with that user's ledger permissions, minus the actions kept
+  for the person: creating or joining a group, group settings, leaving a
+  group, removing a member, and confirming or rejecting a payment all answer
+  403. Reading (groups, expenses, history, debts, rates, export), creating,
+  editing, deleting and restoring the user's own expenses, receipts and
+  claiming a payment are allowed.
+- Agent writes are recorded as that user's: history does not tell them apart.
+- The key is compared in constant time and is never logged or returned. Give
+  it to the agent through its environment, not through chat, and rotate it by
+  changing the variable and restarting the service.
 
 ## Data Model
 
@@ -348,7 +384,8 @@ migrations also work on restored databases from older versions.
 - `handlers.py`: Telegram screens, expense wizard and notifications.
 - `rates.py`: cached currency conversion.
 - `workbook.py`: XLSX writer and group reports.
-- `miniapp.py`: Mini App HTTP server, `initData` validation and its API.
+- `miniapp.py`: Mini App HTTP server, `initData` validation, the optional
+  agent key and the API.
 - `web/`: the Mini App itself, as ES modules — `lib/money.js` (splitting and
   formatting, no DOM), `lib/api.js` (requests, the memory cache and the
   offline queue), `lib/tg.js` (Telegram buttons, haptics, theme, viewport),

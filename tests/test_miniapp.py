@@ -15,6 +15,8 @@ from repository import Repo
 
 TOKEN = "123456:test-token-for-unit-tests"
 URL = "https://expense.ivansavelyev.ru:8443/"
+AGENT_KEY = "agent-key-for-unit-tests-0123456789abcdef"
+FORBIDDEN = "Нет доступа к этому действию."
 
 
 def signed(uid=1, token=TOKEN, **changes):
@@ -140,6 +142,11 @@ class MiniAppTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status, 401)
 
+    async def test_agent_key_is_refused_while_the_mode_is_off(self):
+        for auth in ("agent " + AGENT_KEY, "agent ", "agent"):
+            response = await self.client.get("/api/me", headers={"Authorization": auth})
+            self.assertEqual(response.status, 401, auth)
+
     async def test_membership_and_identity_cannot_be_spoofed(self):
         for suffix in ("", "/expenses", "/expenses/1"):
             self.assertEqual(
@@ -256,6 +263,228 @@ class MiniAppTest(unittest.IsolatedAsyncioTestCase):
             data='{"title":"' + "x" * 40000 + '"}',
         )
         self.assertEqual(response.status, 413)
+
+
+class AgentSettingsTest(unittest.TestCase):
+    def test_half_set_or_malformed_settings_stop_the_start(self):
+        repo = Repo(":memory:")
+        self.addCleanup(repo.close)
+        for key, user_id in [
+            (AGENT_KEY, ""),
+            ("", "1"),
+            (AGENT_KEY[:31], "1"),
+            (AGENT_KEY[:20] + " " + AGENT_KEY[20:], "1"),
+            (AGENT_KEY + "é", "1"),
+            (AGENT_KEY, "ivan"),
+            (AGENT_KEY, "0"),
+            (AGENT_KEY, "-5"),
+            (AGENT_KEY, "1.5"),
+            (AGENT_KEY, str(2**52)),
+        ]:
+            with self.subTest(key=len(key), user_id=user_id):
+                with self.assertRaises(ValueError) as caught:
+                    create_web_app(
+                        repo, TOKEN, URL, agent_key=key, agent_user_id=user_id
+                    )
+                if key:
+                    self.assertNotIn(key, str(caught.exception))
+        create_web_app(repo, TOKEN, URL, agent_key="", agent_user_id="")
+        create_web_app(repo, TOKEN, URL, agent_key=AGENT_KEY, agent_user_id=" 1 ")
+
+
+class AgentAccessTest(unittest.IsolatedAsyncioTestCase):
+    """The agent key acts for user 1 only, and not in everything."""
+
+    async def asyncSetUp(self):
+        self.repo = Repo(":memory:")
+        for uid in (1, 2, 3):
+            self.repo.upsert_user(uid, f"User {uid}")
+        self.gid, code = self.repo.create_group("Trip", 1)
+        self.repo.join_by_code(code, 2)
+        # Cleanups run last in, first out: the clients close before the ledger.
+        self.addCleanup(self.repo.close)
+        self.client = await self.serve("1")
+
+    async def serve(self, agent_user_id):
+        client = TestClient(
+            TestServer(
+                create_web_app(
+                    self.repo,
+                    TOKEN,
+                    URL,
+                    agent_key=AGENT_KEY,
+                    agent_user_id=agent_user_id,
+                )
+            )
+        )
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def agent(self, method, path, key=AGENT_KEY, **kwargs):
+        return await self.client.request(
+            method, path, headers={"Authorization": "agent " + key}, **kwargs
+        )
+
+    async def human(self, method, path, uid=1, **kwargs):
+        return await self.client.request(
+            method, path, headers={"Authorization": "tma " + signed(uid)}, **kwargs
+        )
+
+    def expense(self, **changes):
+        body = {
+            "amount_cents": 10001,
+            "description": "Dinner",
+            "payer": 1,
+            "participants": [1, 2],
+            "operation_id": "operation-123456789",
+        }
+        body.update(changes)
+        return body
+
+    async def test_key_acts_as_its_user_and_keeps_the_stored_name(self):
+        response = await self.agent("GET", "/api/me")
+        self.assertEqual(response.status, 200)
+        text = await response.text()
+        self.assertEqual(json.loads(text)["user"], {"id": 1, "name": "User 1"})
+        self.assertNotIn(AGENT_KEY, text + str(response.headers))
+        self.assertEqual(self.repo.user_name(1), "User 1")
+        # Telegram stays the source of the name; the agent only reads it.
+        await self.human("GET", "/api/me")
+        response = await self.agent("GET", "/api/groups")
+        self.assertEqual(
+            [g["id"] for g in (await response.json())["groups"]], [self.gid]
+        )
+        self.assertEqual(self.repo.user_name(1), "Иван + & = Тест")
+        self.assertEqual(
+            (await (await self.agent("GET", "/api/me")).json())["user"]["name"],
+            "Иван + & = Тест",
+        )
+
+    async def test_wrong_or_malformed_key_is_unauthorized(self):
+        for auth in (
+            "agent " + AGENT_KEY[:-1] + "x",
+            "agent " + AGENT_KEY + "x",
+            "agent " + AGENT_KEY[:-1],
+            "agent " + "é" * len(AGENT_KEY),
+            "agent ",
+            "agent",
+            "agent" + AGENT_KEY,
+            "Agent " + AGENT_KEY,
+            "Bearer " + AGENT_KEY,
+            "tma " + AGENT_KEY,
+            AGENT_KEY,
+        ):
+            response = await self.client.get("/api/me", headers={"Authorization": auth})
+            self.assertEqual(response.status, 401, auth)
+            self.assertNotIn(AGENT_KEY, await response.text())
+
+    async def test_foreign_origin_is_refused_with_a_valid_key(self):
+        response = await self.client.get(
+            "/api/me",
+            headers={
+                "Authorization": "agent " + AGENT_KEY,
+                "Origin": "https://evil.example",
+            },
+        )
+        self.assertEqual(response.status, 403)
+
+    async def test_user_unknown_to_the_ledger_is_refused_and_not_created(self):
+        self.client = await self.serve("99")
+        response = await self.agent("GET", "/api/me")
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.repo.names_for([99]), {99: "99"})
+        self.assertIsNone(self.repo.stored_user_name(99))
+        self.assertEqual((await self.agent("GET", "/api/me", key="x" * 40)).status, 401)
+
+    async def test_agent_cannot_manage_groups_or_settle_payments(self):
+        solo, _ = self.repo.create_group("Solo", 1)
+        other, other_code = self.repo.create_group("Other", 2)
+        self.repo.create_expense(self.gid, 1, 1, "Dinner", 10000, {2: 10000})
+        confirm = self.repo.request_settlement(2, 1, "RUB", 4000)
+        cases = [
+            ("POST", "/api/groups", {"title": "Home", "currency": "EUR"}),
+            ("POST", "/api/join", {"code": other_code}),
+            ("POST", f"/api/groups/{solo}/settings", {"title": "Renamed"}),
+            ("POST", f"/api/groups/{solo}/settings/5", {"title": "Renamed"}),
+            ("POST", f"/api/groups/{solo}/leave", {}),
+            ("POST", f"/api/groups/{solo}/leave/5", {}),
+            ("POST", f"/api/payments/{confirm}/reject", {}),
+            ("POST", f"/api/payments/{confirm}/confirm", {}),
+        ]
+        for method, path, body in cases:
+            response = await self.agent(method, path, json=body)
+            self.assertEqual(response.status, 403, path)
+            self.assertEqual((await response.json())["error"], FORBIDDEN)
+        self.assertEqual(len(self.repo.list_user_groups(1)), 2)
+        self.assertEqual(self.repo.get_group_title(solo), "Solo")
+        self.assertEqual(self.repo.compute_user_debts(2)[1]["RUB"]["net"], -10000)
+        self.assertEqual(len(self.repo.list_pending_settlements(1)), 1)
+        # The same user, signed by Telegram, is held to the old rules only.
+        for method, path, body in cases:
+            if path.endswith(("/5", "/reject")):
+                continue
+            response = await self.human(method, path, json=body)
+            self.assertEqual(response.status, 200, path)
+        self.assertEqual(len(self.repo.list_user_groups(1)), 3)
+        self.assertTrue(self.repo.is_group_member(other, 1))
+        self.assertEqual(self.repo.compute_user_debts(2)[1]["RUB"]["net"], -6000)
+
+        reject = self.repo.request_settlement(2, 1, "RUB", 1000)
+        path = f"/api/payments/{reject}/reject"
+        self.assertEqual((await self.agent("POST", path, json={})).status, 403)
+        self.assertEqual((await self.human("POST", path, json={})).status, 200)
+
+    async def test_agent_cannot_remove_a_member(self):
+        path = f"/api/groups/{self.gid}/members/2"
+        response = await self.agent("DELETE", path)
+        self.assertEqual(response.status, 403)
+        self.assertEqual((await response.json())["error"], FORBIDDEN)
+        self.assertTrue(self.repo.is_group_member(self.gid, 2))
+        self.assertEqual((await self.human("DELETE", path)).status, 200)
+        self.assertFalse(self.repo.is_group_member(self.gid, 2))
+
+    async def test_agent_keeps_the_ledger_as_its_user(self):
+        group = f"/api/groups/{self.gid}"
+        response = await self.agent("POST", f"{group}/expenses", json=self.expense())
+        self.assertEqual(response.status, 200)
+        eid = (await response.json())["id"]
+        stored = self.repo.get_expense(eid, self.gid)
+        self.assertEqual(stored["created_by"], 1)
+        path = f"{group}/expenses/{eid}"
+        card = await (await self.agent("GET", path)).json()
+        self.assertTrue(card["can_edit"])
+        response = await self.agent(
+            "POST",
+            path,
+            json=self.expense(amount_cents=30000, revision=stored["revision"]),
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.repo.get_expense(eid, self.gid)["amount_cents"], 30000)
+        self.assertEqual((await self.agent("DELETE", path)).status, 200)
+        self.assertEqual(
+            (await self.agent("POST", f"{path}/restore", json={})).status, 200
+        )
+        self.assertFalse(self.repo.get_expense(eid, self.gid)["deleted"])
+        history = (await (await self.agent("GET", f"{path}/history")).json())["history"]
+        self.assertEqual({record["actor"] for record in history}, {1})
+        self.assertEqual(len(history), 4)
+        for read in ("", "/expenses", "/export"):
+            self.assertEqual((await self.agent("GET", group + read)).status, 200, read)
+        self.assertEqual((await self.agent("GET", "/api/debts")).status, 200)
+
+        # Somebody else's expense stays theirs, and a claim to have paid is allowed.
+        theirs = self.repo.create_expense(self.gid, 2, 2, "Taxi", 80000, {1: 80000})
+        self.assertEqual(
+            (await self.agent("DELETE", f"{group}/expenses/{theirs}")).status, 403
+        )
+        response = await self.agent(
+            "POST",
+            "/api/payments",
+            json={"other": 2, "currency": "RUB", "amount_cents": 1000},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.repo.user_name(1), "User 1")
 
 
 class WebModuleTest(unittest.TestCase):
